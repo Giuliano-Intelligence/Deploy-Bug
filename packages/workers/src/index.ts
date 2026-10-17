@@ -38,3 +38,5 @@ export class WorkerFactory {
   get(app: string) { return this.defs.get(app); }
   list() { return [...this.defs.keys()].map(a => `${a}-worker`); }
 }
+export * from "./consensus.ts";
+export * from "./toolkits.ts";

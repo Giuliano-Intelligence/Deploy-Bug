@@ -86,3 +86,29 @@ export function gitStageOps(sh: (cmd: string, args: string[], input?: string) =>
     async deleteBranch(branch) { sh("git", ["push", "origin", "--delete", branch]); },
   };
 }
+
+export function appStageOps(api: (path: string, init?: RequestInit) => Promise<any>): StageOps {
+  const post = (path: string, body: unknown, method = "POST") => api(path, { method, body: JSON.stringify(body) });
+  return {
+    async headOf(branch) { return (await api(`/git/ref/heads/${branch}`)).object.sha; },
+    async createBranch(branch, sha) { await post("/git/refs", { ref: `refs/heads/${branch}`, sha }); },
+    async commit(branch, files, message) {
+      const parent = (await api(`/git/ref/heads/${branch}`)).object.sha;
+      const baseTree = (await api(`/git/commits/${parent}`)).tree.sha;
+      const tree = await post("/git/trees", { base_tree: baseTree, tree: files.map(f => f.content === null
+        ? { path: f.path, mode: "100644", type: "blob", sha: null }
+        : { path: f.path, mode: "100644", type: "blob", content: f.content }) });
+      const c = await post("/git/commits", { message, tree: tree.sha, parents: [parent] });
+      await post(`/git/refs/heads/${branch}`, { sha: c.sha, force: false }, "PATCH");
+      return c.sha;
+    },
+    async guardConclusion(sha) {
+      const r = await api(`/actions/runs?head_sha=${sha}`);
+      const run = (r.workflow_runs ?? []).find((x: any) => x.name === "deploybug-guard");
+      if (!run || run.status !== "completed") return "pending";
+      return run.conclusion === "success" ? "success" : "failure";
+    },
+    async fastForward(branch, sha) { await post(`/git/refs/heads/${branch}`, { sha, force: false }, "PATCH"); },
+    async deleteBranch(branch) { await api(`/git/refs/heads/${branch}`, { method: "DELETE" }); },
+  };
+}

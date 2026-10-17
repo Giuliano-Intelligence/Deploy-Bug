@@ -2,8 +2,8 @@ import { Hono } from "hono";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { stagedPush, composioStageOps, stageBranch, signedMessage } from "./stage.ts";
-import { ComposioConnectMcp, MuxMedia } from "@deploybug/providers";
+import { stagedPush, composioStageOps, appStageOps, stageBranch, signedMessage } from "./stage.ts";
+import { ComposioConnectMcp, MuxMedia, GitHubAppClient, appConfig } from "@deploybug/providers";
 import { cors } from "hono/cors";
 import { ingestComment } from "./ingest.ts";
 import { analysePush, pushTicketText, type PushRequest } from "./push.ts";
@@ -11,14 +11,14 @@ import { randomUUID } from "node:crypto";
 import { PolicyEngine, loadPolicies, type ActionRequest } from "@deploybug/policy";
 import { InjectionChecker, loadModels } from "@deploybug/checker";
 import { providerRegistry } from "@deploybug/providers";
-import { WorkerFactory, reviewPush } from "@deploybug/workers";
+import { WorkerFactory, reviewPush, consensus, agentVoter, agentJudge, ToolkitAgents, KNOWN_TOOLKITS, type Voter, type Judge } from "@deploybug/workers";
 import { resolveProvider } from "@deploybug/checker";
 import { FileVault, ProfileStore, type CredentialStore } from "@deploybug/vault";
 import { factsFromRequest, summarizeTicket, templateAlert, formatTime } from "@deploybug/summarizer";
 import { createQueue } from "@deploybug/queue";
 import { TelegramNotifier, type Ticket } from "@deploybug/notifier";
 
-export function buildGate(opts: { notifier?: TelegramNotifier; vault?: CredentialStore; media?: MuxMedia } = {}) {
+export function buildGate(opts: { notifier?: TelegramNotifier; vault?: CredentialStore; media?: MuxMedia; consensus?: { voters: [Voter, Voter]; judge: Judge }; connect?: (toolkits: string[]) => Promise<Record<string, any>> } = {}) {
   const media = opts.media ?? new MuxMedia();
   const vault = opts.vault ?? new FileVault();
   const profiles = new ProfileStore();
@@ -54,6 +54,11 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
   async function runPush(p: { req: PushRequest; files: { path: string; content: string | null }[]; ticket: string }) {
     const { req, files, ticket } = p;
     const user = req.user ?? process.env.OWNER_USER ?? "owner";
+    const ghApp = appConfig();
+    if (ghApp && process.env.DRY_RUN !== "1") {
+      const client = new GitHubAppClient(ghApp);
+      return queue.add(`github:push:${req.repo}`, () => stagedPush(appStageOps((path, init) => client.repoApi(req.repo, path, init)), { repo: req.repo, target: req.branch, ticket, message: req.message, files, key: signingKey() }));
+    }
     const cred = await vault.get(user, "composio");
     let live = process.env.DRY_RUN !== "1" && !!cred?.apiKey?.startsWith("ck_");
     let mcp: ComposioConnectMcp | undefined;
@@ -82,6 +87,35 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     return { status: "executed", result };
   }
 
+  const ep = (prov: string, model: string) => { const r = resolveProvider(models, prov); return r.key && r.base ? { model, key: r.key, base: r.base } : undefined; };
+  const panel = (() => {
+    if (opts.consensus) return opts.consensus;
+    if (process.env.DRY_RUN === "1" || process.env.CONSENSUS === "0") return undefined;
+    const v = ep(models.brain.provider, models.brain.model), j = ep("openrouter", process.env.DECISION_MODEL ?? "z-ai/glm-5.3");
+    return v && j ? { voters: [agentVoter(v, "a"), agentVoter(v, "b")] as [Voter, Voter], judge: agentJudge(j) } : undefined;
+  })();
+  async function critical(kind: string, subject: string, user?: string) {
+    if (!panel) return undefined;
+    const r = await consensus(kind, subject, panel.voters, panel.judge, 5);
+    if (r.ticket) {
+      const t: Ticket = { id: randomUUID().slice(0, 8), summary: `${kind} check failed: ${r.why}`, createdAt: Date.now(), status: "denied", payload: { kind: "consensus", subject: subject.slice(0, 500) } as any };
+      tickets.set(t.id, t);
+      await notifier.sendAlert(templateAlert(`${kind}-consensus`, new Error(r.why), t.id, tzOf(user))).catch(() => {});
+      log({ consensus: kind, ticket: t.id, attempts: r.attempts });
+      return { ...r, ticketId: t.id };
+    }
+    log({ consensus: kind, verdict: r.verdict, attempts: r.attempts });
+    return r;
+  }
+  const toolkitAgents = new ToolkitAgents(() => ep(models.brain.provider, models.brain.model));
+  const connectFn = opts.connect ?? (async (toolkits: string[]) => {
+    const cred = await vault.get(process.env.OWNER_USER ?? "owner", "composio");
+    const key = cred?.apiKey ?? (existsSync("/tmp/keys/composio") ? readFileSync("/tmp/keys/composio", "utf8").trim() : "");
+    if (!key.startsWith("ck_")) throw new Error("no Composio Connect key");
+    const r: any = await new ComposioConnectMcp(key).callTool("COMPOSIO_MANAGE_CONNECTIONS", { toolkits: toolkits.map(name => ({ name, action: "add" })) });
+    return r?.data?.results ?? {};
+  });
+
   const app = new Hono();
   const token = process.env.GATE_AGENT_TOKEN;
   app.use("/requests/*", async (c, next) => { if (token && c.req.header("authorization") !== `Bearer ${token}`) return c.json({ error: "unauthorized" }, 401); await next(); });
@@ -89,6 +123,42 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
 
   app.get("/", c => c.json({ name: "deploybug-gate", workers: workers.list(), telegram: notifier.enabled, queue: queue.status(), models: { brain: models.brain.model, panel: models.panel.map(m => m.id ?? m.model), escalation: models.escalation?.model } }));
   app.get("/health", c => c.json({ ok: true }));
+  const ownerOk = (c: any) => { const t = process.env.GATE_OWNER_TOKEN ?? token; return !!t && (c.req.header("authorization") === `Bearer ${t}` || c.req.query("t") === t); };
+  app.get("/connect", async c => {
+    if (!ownerOk(c)) return c.text("unauthorized", 401);
+    const picked = (c.req.query("toolkits") ?? "").split(",").map(x => x.trim().toLowerCase()).filter(x => /^[a-z0-9_]+$/.test(x));
+    const esc = (x: string) => x.replace(/[&<>"']/g, ch => `&#${ch.charCodeAt(0)};`);
+    if (!picked.length) return c.html(`<!doctype html><meta name=viewport content="width=device-width"><title>Connect</title><h2>Connect your tools</h2><form method=get><input type=hidden name=t value="${esc(c.req.query("t") ?? "")}">${KNOWN_TOOLKITS.map(k => `<label style="display:block;font-size:1.3em;margin:.5em 0"><input type=checkbox name=tk value=${k}> ${k}</label>`).join("")}<button style="font-size:1.3em">Get links</button></form><script>document.forms[0].onsubmit=e=>{e.preventDefault();const f=new FormData(e.target);location.search="?t="+encodeURIComponent(f.get("t"))+"&toolkits="+f.getAll("tk").join(",")}</script>`);
+    try {
+      const res = await connectFn(picked);
+      const links = Object.entries(res).map(([k, v]: any) => ({ toolkit: k, status: v.status, url: v.redirect_url }));
+      if (c.req.header("accept")?.includes("application/json")) return c.json({ links });
+      return c.html(`<!doctype html><meta name=viewport content="width=device-width"><h2>Tap each to connect</h2>${links.map(l => l.url ? `<p style="font-size:1.3em"><a href="${esc(l.url)}">Connect ${esc(l.toolkit)}</a></p>` : `<p>${esc(l.toolkit)}: ${esc(String(l.status))}</p>`).join("")}<p>Links expire in 10 minutes.</p>`);
+    } catch (e) { return c.text("Composio is not configured", 502); }
+  });
+  app.post("/connect/sync", async c => {
+    if (!ownerOk(c)) return c.json({ error: "unauthorized" }, 401);
+    let counts = await c.req.json<Record<string, number>>().catch(() => ({} as Record<string, number>));
+    if (!Object.keys(counts).length) {
+      const key = existsSync("/tmp/keys/composio") ? readFileSync("/tmp/keys/composio", "utf8").trim() : "";
+      if (key.startsWith("ck_")) counts = await new ComposioConnectMcp(key).listConnections(KNOWN_TOOLKITS).catch(() => ({}));
+    }
+    return c.json({ agents: toolkitAgents.sync(counts) });
+  });
+  app.get("/connect/agents", c => ownerOk(c) ? c.json({ agents: toolkitAgents.list() }) : c.json({ error: "unauthorized" }, 401));
+  app.post("/composio/events", async c => {
+    const secret = process.env.COMPOSIO_WEBHOOK_SECRET;
+    const raw = await c.req.text();
+    if (secret) {
+      const want = createHmac("sha256", secret).update(raw).digest("hex");
+      const got = (c.req.header("x-composio-signature") ?? "").replace(/^sha256=/, "");
+      if (got.length !== want.length || !timingSafeEqual(Buffer.from(got), Buffer.from(want))) return c.json({ error: "bad signature" }, 401);
+    } else if (!ownerOk(c)) return c.json({ error: "unauthorized" }, 401);
+    let ev: any; try { ev = JSON.parse(raw); } catch { return c.json({ error: "bad json" }, 400); }
+    const check = await checker.check(raw.slice(0, 16000));
+    if (check.score < models.escalateBelow) { log({ composioEvent: "blocked", score: check.score }); return c.json({ routed: false, reason: "event looks like a prompt-injection attempt" }, 403); }
+    return c.json(await toolkitAgents.handle(ev));
+  });
   app.use("/media/*", cors({ origin: "*", allowMethods: ["GET", "OPTIONS"], allowHeaders: ["Authorization"] }));
   app.get("/media/current", async c => {
     const t = process.env.BUGFLIX_GATE_TOKEN ?? token;
@@ -115,6 +185,9 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     }
     const d = policy.evaluate(req);
     if (d.verdict === "block") { log({ req, ...d, check }); return c.json({ ...d, check }, 403); }
+    const kind = /REFUND/i.test(req.tool ?? "") ? "refund" : check.score < 85 ? "injection" : undefined;
+    const cons = kind ? await critical(kind, `${req.app}.${req.tool}\n${text}`, req.user) : undefined;
+    if (cons && cons.verdict === "block") return c.json({ verdict: "block", reason: cons.ticket ? "The two independent checkers could not agree, so it was blocked and a ticket was raised" : "Both independent checkers blocked this", consensus: { attempts: cons.attempts, ticket: (cons as any).ticketId } }, 403);
     if (d.verdict === "approve") {
       const t: Ticket = { id: randomUUID().slice(0, 8), summary: `${req.agent ?? "agent"} → ${req.app}.${req.tool}\n${JSON.stringify(req.args)}\n${d.reason}`, createdAt: Date.now(), status: "pending", payload: req };
       tickets.set(t.id, t);
@@ -153,6 +226,8 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     const rp = resolveProvider(models, models.brain.provider);
     const agentReview = await reviewPush(rp.key && rp.base ? { model: models.brain.model, key: rp.key, base: rp.base } : undefined, req.files ?? [], req.message ?? "");
     const a = await analysePush(req, pol, checker, models.escalateBelow, agentReview.proposals);
+    const cons = a.verdict === "block" ? undefined : await critical("push", [req.message, ...a.sanitized.filter(f => f.content !== null).map(f => `FILE ${f.path}:\n${f.content}`)].join("\n\n").slice(0, 16000), req.user);
+    if (cons && cons.verdict === "block") { a.verdict = "block"; a.reasons.push(cons.ticket ? "The two independent checkers could not agree, so it was blocked and a ticket was raised" : "Both independent checkers blocked this push"); }
     const summary = { agent: agentReview.summary, verdict: a.verdict, reasons: a.reasons, files: a.files, gateChanges: a.gateChanges, score: a.score, scanModel: a.scanModel, secrets: a.secrets };
     if (a.verdict === "block") { log({ push: req.repo, branch: req.branch, ...summary }); return c.json(summary, 403); }
     if (a.verdict === "approve") {
