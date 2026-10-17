@@ -1,0 +1,21 @@
+import { test } from "node:test";
+import assert from "node:assert";
+process.env.DRY_RUN = "1"; process.env.VAULT_FILE = "/tmp/deploybug-ui-vault.json"; process.env.CHECKER_OFFLINE = "1";
+process.env.GATE_OWNER_TOKEN = "owner-token-0123456789abcdef"; process.env.GATE_AGENT_TOKEN = "agent-token-0123456789abcdef";
+const { buildGate } = await import("../apps/gate/src/app.ts");
+const { GateStore } = await import("../apps/gate/src/persist.ts");
+const { TelegramNotifier } = await import("@deploybug/notifier");
+test("dashboard needs a one-time code, data stays private", async () => {
+  const g = buildGate({ notifier: new TelegramNotifier(undefined), gateStore: new GateStore(`/tmp/db-ui-${process.pid}`) });
+  assert.equal((await g.app.request("/")).status, 200);
+  assert.equal((await g.app.request("/ui/data")).status, 401);
+  assert.equal((await g.app.request("/ui/data", { headers: { authorization: "Bearer agent-token-0123456789abcdef" } })).status, 401);
+  const { code }: any = await (await g.app.request("/connect/code", { method: "POST", headers: { authorization: "Bearer owner-token-0123456789abcdef" } })).json();
+  const r = await g.app.request(`/?c=${code}`);
+  assert.equal(r.status, 302);
+  const cookie = r.headers.get("set-cookie")!.split(";")[0];
+  assert.match(r.headers.get("set-cookie")!, /HttpOnly/);
+  const d: any = await (await g.app.request("/ui/data", { headers: { cookie } })).json();
+  assert.ok(d.connectors.length > 10);
+  assert.equal((await g.app.request(`/?c=${code}`)).status, 401);
+});

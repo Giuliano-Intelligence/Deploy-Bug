@@ -6,7 +6,7 @@ export interface PushPolicy { repos: string[]; branches: string[]; protectedBran
 export interface PushFile { path: string; content: string | null }
 export interface PushRequest { agent?: string; user?: string; repo: string; branch: string; message: string; files?: PushFile[]; diff?: string }
 
-export const SENSITIVE = [".github/*", ".circleci/*", ".gitlab-ci.yml", ".coderabbit.yaml", "scripts/*", "Dockerfile", "*/Dockerfile", ".husky/*", ".npmrc"];
+export const SENSITIVE = [".github/*", "packages/sanitize/*", "package-lock.json", "package.json", "tsconfig*", "*/tsconfig*", "scripts/*", "config/*", ".circleci/*", ".gitlab-ci.yml", ".coderabbit.yaml", "scripts/*", "Dockerfile", "*/Dockerfile", ".husky/*", ".npmrc"];
 const glob = (pat: string, s: string) => new RegExp("^" + pat.split("*").map(x => x.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$").test(s);
 
 export interface PushAnalysis {
@@ -65,7 +65,8 @@ export async function analysePush(req: PushRequest, pol: PushPolicy, checker: In
   const exempt = isOwner ? (pol.injectionExemptPaths ?? []) : [];
   const corpus = [`COMMIT MESSAGE: ${req.message}`, ...sanitized.filter(f => f.content !== null && !exempt.some(g => glob(g, f.path))).map(f => `FILE ${f.path}:\n${f.content}`)].join("\n\n").slice(0, 24_000);
   const check = await checker.check(corpus);
-  if (check.score < threshold) block(`The code or text looks like a prompt-injection attempt (safety ${check.score}/100)`);
+  if (check.score < threshold && check.disputed && isOwner) needApproval(`Checkers disagree on this change (panel ${check.score}/100, escalation says safe), so it never auto-allows; your sign-off decides`);
+  else if (check.score < threshold) block(`The code or text looks like a prompt-injection attempt (safety ${check.score}/100)`);
 
   if (pol.protectedBranches.includes(req.branch)) needApproval(`Pushes to ${req.branch} always need your sign-off`);
   if (pol.alwaysRequireApproval) needApproval("Every push needs your sign-off");

@@ -5,7 +5,7 @@ export interface ProviderRef { baseUrlEnv: string; baseUrlDefault?: string; apiK
 export interface PanelModel { id?: string; provider: string; model: string; kind?: "guard" | "score"; weight?: number; timeoutMs?: number; reasoning?: string }
 export interface ModelsConfig { providers: Record<string, ProviderRef>; brain: PanelModel; panel: PanelModel[]; escalateBelow: number; escalation?: PanelModel }
 export interface ModelResult { id: string; model: string; score?: number; ms: number; error?: string; raw?: string }
-export interface Verdict { score: number; escalated: boolean; reasons: string[]; model: string; panel: ModelResult[]; heuristic: number }
+export interface Verdict { score: number; escalated: boolean; reasons: string[]; model: string; panel: ModelResult[]; heuristic: number; disputed?: boolean }
 
 export function loadModels(path = "config/models.yaml"): ModelsConfig { return parse(readFileSync(path, "utf8")); }
 
@@ -74,12 +74,12 @@ export class InjectionChecker {
     const offline = process.env.CHECKER_OFFLINE === "1";
     let score = agg === undefined ? (panel.length && !offline ? 0 : h.score) : Math.min(h.score, agg, failed && !offline ? Math.max(0, 100 - Math.round(100 * failed / panel.length)) : 100);
     let model = ok.length ? `panel(${ok.length}/${panel.length})` : "heuristic";
-    let escalated = false;
+    let escalated = false, disputed = false;
     if (score < this.cfg.escalateBelow && this.cfg.escalation) {
       const d = await callModel(this.cfg, { ...this.cfg.escalation, kind: "score" }, text);
       panel.push({ ...d, id: `escalation:${d.id}` });
-      if (d.score !== undefined) { escalated = true; model = d.model; score = h.score < 50 ? Math.min(h.score, d.score) : d.score; }
+      if (d.score !== undefined) { escalated = true; model = `${model}+${d.model}`; disputed = d.score >= this.cfg.escalateBelow && score < this.cfg.escalateBelow; score = Math.min(score, d.score); }
     }
-    return { score, escalated, reasons: h.reasons, model, panel, heuristic: h.score };
+    return { score, escalated, disputed, reasons: h.reasons, model, panel, heuristic: h.score };
   }
 }

@@ -5,6 +5,9 @@ import { dirname } from "node:path";
 import { runRollback, appRollbackSource, type RollbackSource } from "./rollback.ts";
 import { execFile } from "node:child_process";
 import { VpnMode } from "./vpn.ts";
+import { DASHBOARD, MANIFEST, ICON } from "./ui.ts";
+import { randomBytes } from "node:crypto";
+import { GateStore, RateLimiter } from "./persist.ts";
 import { gateTokens, principal, isOwner, isAgentOrOwner, OneTimeCodes, safeEq } from "./auth.ts";
 import { stagedPush, composioStageOps, appStageOps, type StageOps, stageBranch, signedMessage } from "./stage.ts";
 import { ComposioConnectMcp, MuxMedia, GitHubAppClient, appConfig } from "@deploybug/providers";
@@ -22,7 +25,7 @@ import { factsFromRequest, summarizeTicket, templateAlert, formatTime } from "@d
 import { createQueue } from "@deploybug/queue";
 import { TelegramNotifier, type Ticket } from "@deploybug/notifier";
 
-export function buildGate(opts: { notifier?: TelegramNotifier; vault?: CredentialStore; media?: MuxMedia; runner?: StepRunner; store?: ResultStore; connect?: (toolkits: string[]) => Promise<Record<string, any>>; rollback?: { source: RollbackSource; ops: StageOps; wait?: { tries: number; ms: number } }; redeploy?: (repo: string) => Promise<unknown>; vpn?: VpnMode; chargeLookup?: (charge: string, user?: string) => Promise<string | undefined> } = {}) {
+export function buildGate(opts: { notifier?: TelegramNotifier; vault?: CredentialStore; media?: MuxMedia; runner?: StepRunner; store?: ResultStore; connect?: (toolkits: string[]) => Promise<Record<string, any>>; rollback?: { source: RollbackSource; ops: StageOps; wait?: { tries: number; ms: number } }; redeploy?: (repo: string) => Promise<unknown>; vpn?: VpnMode; chargeLookup?: (charge: string, user?: string) => Promise<string | undefined>; gateStore?: GateStore; rateLimiter?: RateLimiter } = {}) {
   const vpn = opts.vpn ?? new VpnMode();
   gateTokens();
   const codes = new OneTimeCodes();
@@ -37,9 +40,10 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
   for (const [app, p] of Object.entries(policy.policies.apps)) workers.register(app, p);
   const notifier = opts.notifier ?? new TelegramNotifier();
   const queue = createQueue();
-  const tickets = new Map<string, Ticket>();
-  const audit: any[] = [];
-  const log = (e: any) => { audit.push({ at: new Date().toISOString(), ...e }); if (audit.length > 500) audit.shift(); };
+  const gstore = opts.gateStore ?? new GateStore();
+  const tickets = new Map<string, Ticket>(gstore.loadTickets<Ticket>());
+  const audit: any[] = gstore.loadAudit();
+  const log = (e: any) => { const rec = { at: new Date().toISOString(), ...e }; audit.push(rec); if (audit.length > 500) audit.shift(); try { gstore.appendAudit(rec); gstore.saveTickets(tickets); } catch {} };
 
   async function execute(req: ActionRequest) {
     const w = workers.get(req.app)!;
@@ -95,6 +99,11 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
   }
 
   async function decide(id: string, approve: boolean) {
+    const r = await decideInner(id, approve);
+    try { gstore.saveTickets(tickets); } catch {}
+    return r;
+  }
+  async function decideInner(id: string, approve: boolean) {
     const t = tickets.get(id);
     if (!t || t.status !== "pending") return { error: "no pending ticket" };
     t.status = approve ? "approved" : "denied";
@@ -156,12 +165,45 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     return typeof j.customer === "string" ? j.customer : j.customer?.id;
   });
   const app = new Hono();
+  const limiter = opts.rateLimiter ?? new RateLimiter();
+  app.use("*", async (c, next) => {
+    const key = c.req.header("authorization") ?? `ip:${c.req.header("x-forwarded-for") ?? (c.env as any)?.incoming?.socket?.remoteAddress ?? "local"}`;
+    if (c.req.path !== "/health" && !limiter.allow(key)) return c.json({ error: "rate limited" }, 429);
+    await next();
+  });
   app.use("*", async (c, next) => { if (c.req.path === "/health" || vpn.allows(c)) return next(); return c.json({ error: "this gate only answers over its WireGuard VPN" }, 403); });
   const agentOnly = async (c: any, next: any) => { if (!isAgentOrOwner(c)) return c.json({ error: "unauthorized" }, 401); await next(); };
   const owner = async (c: any, next: any) => { if (!isOwner(c)) return c.json({ error: "unauthorized" }, 401); await next(); };
   app.use("/requests/*", agentOnly); app.use("/requests", agentOnly);
 
-  app.get("/", c => c.json({ name: "deploybug-gate", workers: workers.list(), telegram: notifier.enabled, queue: queue.status(), models: { brain: models.brain.model, panel: models.panel.map(m => m.id ?? m.model), escalation: models.escalation?.model } }));
+  const sessions = new Map<string, number>();
+  const sessionOk = (c: any) => {
+    const m = String(c.req.header("cookie") ?? "").match(/(?:^|;\s*)db_session=([A-Za-z0-9_-]+)/);
+    if (!m) return false;
+    for (const [k, exp] of sessions) if (exp < Date.now()) sessions.delete(k);
+    for (const k of sessions.keys()) if (safeEq(k, m[1])) return true;
+    return false;
+  };
+  app.get("/", c => {
+    const code = c.req.query("c");
+    if (code) {
+      if (!codes.consume(code)) return c.html(DASHBOARD, 401);
+      const sid = randomBytes(24).toString("base64url");
+      sessions.set(sid, Date.now() + 12 * 3600_000);
+      return c.body(null, 302, { location: "/", "set-cookie": `db_session=${sid}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=43200`, "cache-control": "no-store" });
+    }
+    return c.html(DASHBOARD, 200, { "cache-control": "no-store", "content-security-policy": "default-src 'self'; script-src 'unsafe-inline' 'self'; style-src 'unsafe-inline'; img-src 'self'; connect-src 'self'; frame-ancestors 'none'" });
+  });
+  app.get("/manifest.webmanifest", c => c.body(MANIFEST, 200, { "content-type": "application/manifest+json" }));
+  app.get("/icon.svg", c => c.body(ICON, 200, { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400" }));
+  app.get("/ui/data", c => {
+    if (!isOwner(c) && !sessionOk(c)) return c.json({ error: "unauthorized" }, 401);
+    return c.json({ workers: workers.list(), models: { brain: models.brain.model }, queue: queue.status(), telegram: notifier.enabled, dryRun: process.env.DRY_RUN === "1",
+      connectors: CONNECTORS.map(k => ({ slug: k.slug, name: k.name, via: k.via })), connected: toolkitAgents.list().map(a => a.replace(/-agent$/, "")),
+      tickets: [...tickets.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, 30).map(t => ({ id: t.id, status: t.status, summary: t.summary.slice(0, 200), createdAt: t.createdAt })),
+      runs: store.pending().map((r: any) => ({ id: r.id, kind: r.kind, verdict: r.verdict })), audit: audit.slice(-30).reverse().map(a => ({ at: a.at, verdict: a.verdict, status: a.status, ticket: a.ticket })) });
+  });
+  app.get("/status.json", c => c.json({ name: "deploybug-gate", workers: workers.list(), telegram: notifier.enabled, queue: queue.status(), models: { brain: models.brain.model, panel: models.panel.map(m => m.id ?? m.model), escalation: models.escalation?.model } }));
   app.get("/health", c => c.json({ ok: true }));
   const ownerOk = (c: any) => isOwner(c);
   app.post("/connect/code", c => ownerOk(c) ? c.json({ code: codes.issue(), expiresInSec: 600, url: `/connect?c=CODE` }) : c.json({ error: "unauthorized" }, 401));

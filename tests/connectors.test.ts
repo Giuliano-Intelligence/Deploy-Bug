@@ -7,10 +7,10 @@ const { buildGate } = await import("../apps/gate/src/app.ts");
 const { TelegramNotifier } = await import("@deploybug/notifier");
 const O = { authorization: "Bearer owner-token-0123456789abcdef", accept: "application/json" };
 
-test("catalog has the builder tools, no Vercel, Aikido as custom MCP", () => {
+test("catalog has the builder tools, Aikido and Expo as custom MCP", () => {
   const s = CONNECTORS.map(c => c.slug);
   for (const k of ["github", "supabase", "neon", "clerk", "aws", "cloudflare", "stripe", "sentry", "mux", "aikido"]) assert.ok(s.includes(k), k);
-  assert.ok(!s.includes("vercel"));
+  assert.ok(s.includes("vercel")); assert.equal(CONNECTORS.find(c => c.slug === "expo")!.via, "custom_mcp");
   assert.equal(CONNECTORS.find(c => c.slug === "aikido")!.via, "custom_mcp");
 });
 test("connect sends only Composio toolkits to Composio", async () => {
