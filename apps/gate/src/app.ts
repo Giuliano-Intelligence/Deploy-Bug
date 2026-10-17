@@ -3,7 +3,8 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { stagedPush, composioStageOps, stageBranch, signedMessage } from "./stage.ts";
-import { ComposioConnectMcp } from "@deploybug/providers";
+import { ComposioConnectMcp, MuxMedia } from "@deploybug/providers";
+import { cors } from "hono/cors";
 import { ingestComment } from "./ingest.ts";
 import { analysePush, pushTicketText, type PushRequest } from "./push.ts";
 import { randomUUID } from "node:crypto";
@@ -17,7 +18,8 @@ import { factsFromRequest, summarizeTicket, templateAlert, formatTime } from "@d
 import { createQueue } from "@deploybug/queue";
 import { TelegramNotifier, type Ticket } from "@deploybug/notifier";
 
-export function buildGate(opts: { notifier?: TelegramNotifier; vault?: CredentialStore } = {}) {
+export function buildGate(opts: { notifier?: TelegramNotifier; vault?: CredentialStore; media?: MuxMedia } = {}) {
+  const media = opts.media ?? new MuxMedia();
   const vault = opts.vault ?? new FileVault();
   const profiles = new ProfileStore();
   const tzOf = (user?: string) => profiles.get(user ?? process.env.OWNER_USER ?? "owner").timezone;
@@ -87,6 +89,16 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
 
   app.get("/", c => c.json({ name: "deploybug-gate", workers: workers.list(), telegram: notifier.enabled, queue: queue.status(), models: { brain: models.brain.model, panel: models.panel.map(m => m.id ?? m.model), escalation: models.escalation?.model } }));
   app.get("/health", c => c.json({ ok: true }));
+  app.use("/media/*", cors({ origin: "*", allowMethods: ["GET", "OPTIONS"], allowHeaders: ["Authorization"] }));
+  app.get("/media/current", async c => {
+    const t = process.env.BUGFLIX_GATE_TOKEN ?? token;
+    if (!t || c.req.header("authorization") !== `Bearer ${t}`) return c.json({ error: "unauthorized" }, 401);
+    try {
+      const m = await media.current();
+      if (!m) return c.json({ playbackId: null }, 404);
+      return c.json({ playbackId: m.playbackId, title: m.title ?? null, description: m.description ?? null });
+    } catch (e) { return c.json({ error: "media unavailable" }, 502); }
+  });
   app.get("/workers", c => c.json(workers.list()));
   const owner = async (c: any, next: any) => { const t = process.env.GATE_OWNER_TOKEN ?? token; if (t && c.req.header("authorization") !== `Bearer ${t}`) return c.json({ error: "unauthorized" }, 401); await next(); };
   app.use("/audit", owner); app.use("/tickets", owner);

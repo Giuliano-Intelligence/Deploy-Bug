@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 export interface ToolContext { user?: string; credentials?: Record<string, string> }
@@ -92,5 +93,31 @@ export class HiveContentCheck {
     const classes = raw?.status?.[0]?.response?.output?.[0]?.classes ?? [];
     const ai = classes.find((c: any) => c.class === "ai_generated")?.score;
     return { enabled: true, aiGenerated: ai, raw };
+  }
+}
+
+export interface MediaItem { playbackId: string; title?: string; description?: string; assetId: string }
+
+export function muxCredentials(): { id?: string; secret?: string } {
+  const read = (f: string) => { try { return readFileSync(f, "utf8").trim() || undefined; } catch { return undefined; } };
+  return { id: process.env.MUX_TOKEN_ID ?? read(process.env.MUX_TOKEN_ID_FILE ?? "/tmp/keys/mux_token_id"), secret: process.env.MUX_TOKEN_SECRET ?? read(process.env.MUX_TOKEN_SECRET_FILE ?? "/tmp/keys/mux_token_secret") };
+}
+
+export class MuxMedia {
+  private cached?: { at: number; value: MediaItem | null };
+  constructor(private opts: { fetch?: typeof fetch; ttlMs?: number; creds?: () => { id?: string; secret?: string }; now?: () => number } = {}) {}
+  async current(): Promise<MediaItem | null> {
+    const now = (this.opts.now ?? Date.now)();
+    if (this.cached && now - this.cached.at < (this.opts.ttlMs ?? 60_000)) return this.cached.value;
+    const { id, secret } = (this.opts.creds ?? muxCredentials)();
+    if (!id || !secret) throw new Error("Mux credentials are not configured");
+    const r = await (this.opts.fetch ?? fetch)("https://api.mux.com/video/v1/assets?limit=100", { headers: { authorization: "Basic " + Buffer.from(`${id}:${secret}`).toString("base64") } });
+    if (!r.ok) throw new Error(`Mux returned ${r.status}`);
+    const assets: any[] = ((await r.json()) as any).data ?? [];
+    const pick = assets.filter(a => a.status === "ready" && (a.playback_ids ?? []).some((p: any) => p.policy === "public"))
+      .sort((a, b) => Number(b.created_at ?? 0) - Number(a.created_at ?? 0))[0];
+    const value = pick ? { assetId: pick.id, playbackId: pick.playback_ids.find((p: any) => p.policy === "public").id, title: pick.meta?.title, description: pick.meta?.description } : null;
+    this.cached = { at: now, value };
+    return value;
   }
 }
