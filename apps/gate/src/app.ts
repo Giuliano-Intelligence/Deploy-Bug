@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { runRollback, appRollbackSource, type RollbackSource } from "./rollback.ts";
 import { execFile } from "node:child_process";
+import { VpnMode } from "./vpn.ts";
 import { stagedPush, composioStageOps, appStageOps, type StageOps, stageBranch, signedMessage } from "./stage.ts";
 import { ComposioConnectMcp, MuxMedia, GitHubAppClient, appConfig } from "@deploybug/providers";
 import { cors } from "hono/cors";
@@ -20,7 +21,8 @@ import { factsFromRequest, summarizeTicket, templateAlert, formatTime } from "@d
 import { createQueue } from "@deploybug/queue";
 import { TelegramNotifier, type Ticket } from "@deploybug/notifier";
 
-export function buildGate(opts: { notifier?: TelegramNotifier; vault?: CredentialStore; media?: MuxMedia; runner?: StepRunner; store?: ResultStore; connect?: (toolkits: string[]) => Promise<Record<string, any>>; rollback?: { source: RollbackSource; ops: StageOps; wait?: { tries: number; ms: number } }; redeploy?: (repo: string) => Promise<unknown> } = {}) {
+export function buildGate(opts: { notifier?: TelegramNotifier; vault?: CredentialStore; media?: MuxMedia; runner?: StepRunner; store?: ResultStore; connect?: (toolkits: string[]) => Promise<Record<string, any>>; rollback?: { source: RollbackSource; ops: StageOps; wait?: { tries: number; ms: number } }; redeploy?: (repo: string) => Promise<unknown>; vpn?: VpnMode } = {}) {
+  const vpn = opts.vpn ?? new VpnMode();
   const media = opts.media ?? new MuxMedia();
   const vault = opts.vault ?? new FileVault();
   const profiles = new ProfileStore();
@@ -143,6 +145,7 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
   });
 
   const app = new Hono();
+  app.use("*", async (c, next) => { if (c.req.path === "/health" || vpn.allows(c)) return next(); return c.json({ error: "this gate only answers over its WireGuard VPN" }, 403); });
   const token = process.env.GATE_AGENT_TOKEN;
   app.use("/requests/*", async (c, next) => { if (token && c.req.header("authorization") !== `Bearer ${token}`) return c.json({ error: "unauthorized" }, 401); await next(); });
   app.use("/requests", async (c, next) => { if (token && c.req.header("authorization") !== `Bearer ${token}`) return c.json({ error: "unauthorized" }, 401); await next(); });
@@ -195,6 +198,21 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     await notifier.sendAlert(templateAlert("auto-rollback", new Error(`Hack or injection detected on ${repo} ${branch}. Rolled back automatically: ${result?.pushed ? "yes" : "no"}. Evidence: ${evidence.slice(0, 160)}`), id, tzOf(user))).catch(() => {});
     return { rolledBack: !!result?.pushed, ticket: id, result };
   }
+  app.get("/vpn", c => ownerOk(c) ? c.json(vpn.status()) : c.json({ error: "unauthorized" }, 401));
+  app.post("/vpn", async c => {
+    if (!ownerOk(c)) return c.json({ error: "unauthorized" }, 401);
+    const b = await c.req.json<{ enabled: boolean }>().catch(() => ({ enabled: false }));
+    if (b.enabled && !vpn.status().peerConfig) return c.json({ error: "no WireGuard peer config yet, so VPN mode stays off to avoid a lockout" }, 409);
+    log({ vpn: b.enabled === true });
+    return c.json(vpn.set(b.enabled === true));
+  });
+  app.get("/vpn/config", async c => {
+    if (!ownerOk(c)) return c.json({ error: "unauthorized" }, 401);
+    const p = await vpn.peer();
+    if (!p) return c.json({ error: "no WireGuard peer config on the gate" }, 404);
+    if (c.req.query("format") === "qr") return c.body(p.qrSvg, 200, { "content-type": "image/svg+xml", "cache-control": "no-store" });
+    return c.json(p, 200, { "cache-control": "no-store" });
+  });
   app.post("/incident", async c => {
     if (!ownerOk(c) && !(token && c.req.header("authorization") === `Bearer ${token}`)) return c.json({ error: "unauthorized" }, 401);
     const b = await c.req.json<{ repo: string; branch?: string; evidence: string }>();
