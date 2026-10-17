@@ -1,6 +1,6 @@
 import { stripComments, scanSecrets, type SecretHit } from "@deploybug/sanitize";
 import type { InjectionChecker } from "@deploybug/checker";
-import { GateActionGuard, removeDependency, type GateChange } from "@deploybug/policy";
+import { GATE_ACTIONS, GateActionGuard, removeDependency, type GateChange } from "@deploybug/policy";
 
 export interface PushPolicy { repos: string[]; branches: string[]; protectedBranches: string[]; alwaysRequireApproval?: boolean; keepLicenseHeaders?: boolean; stripConfigComments?: boolean; maxFiles?: number; maxFileBytes?: number; gateActions?: string[]; autoDeleteFiles?: string[]; removeDependencies?: string[] }
 export interface PushFile { path: string; content: string | null }
@@ -14,7 +14,7 @@ export interface PushAnalysis {
   sanitized: PushFile[]; secrets: SecretHit[]; score: number; scanModel: string;
 }
 
-export async function analysePush(req: PushRequest, pol: PushPolicy, checker: InjectionChecker, threshold: number): Promise<PushAnalysis> {
+export async function analysePush(req: PushRequest, pol: PushPolicy, checker: InjectionChecker, threshold: number, proposals: GateChange[] = []): Promise<PushAnalysis> {
   const reasons: string[] = []; let verdict: PushAnalysis["verdict"] = "allow";
   const block = (r: string) => { verdict = "block"; reasons.push(r); };
   const needApproval = (r: string) => { if (verdict !== "block") verdict = "approve"; reasons.push(r); };
@@ -40,11 +40,12 @@ export async function analysePush(req: PushRequest, pol: PushPolicy, checker: In
     if (f.content === null) { sanitized.push(f); files.push({ path: f.path, removedComments: 0, language: "deleted by agent" }); continue; }
     if (f.content.length > (pol.maxFileBytes ?? 200_000)) { block(`${f.path} is too large`); continue; }
     let cur: PushFile = f;
-    if ((pol.autoDeleteFiles ?? []).some(g => glob(g, f.path))) {
+    const mine = proposals.filter(p => p.path === f.path);
+    if ((pol.autoDeleteFiles ?? []).some(g => glob(g, f.path)) || mine.some(p => p.op === "delete_file")) {
       cur = apply({ op: "delete_file", path: f.path }, cur, { path: f.path, content: null });
       sanitized.push(cur); files.push({ path: f.path, removedComments: 0, language: "deleted by gate" }); continue;
     }
-    if (/(^|\/)package\.json$/.test(f.path)) for (const dep of pol.removeDependencies ?? []) {
+    if (/(^|\/)package\.json$/.test(f.path)) for (const dep of [...new Set([...(pol.removeDependencies ?? []), ...mine.filter(p => p.op === "remove_dependency" && p.detail).map(p => p.detail!)])]) {
       let next: string; try { next = removeDependency(cur.content!, dep); } catch { break; }
       if (JSON.stringify(JSON.parse(next)) !== JSON.stringify(JSON.parse(cur.content!))) cur = apply({ op: "remove_dependency", path: f.path, detail: dep }, cur, { path: f.path, content: next });
     }
@@ -53,6 +54,7 @@ export async function analysePush(req: PushRequest, pol: PushPolicy, checker: In
     sanitized.push(cur);
     files.push({ path: f.path, removedComments: r.removed, language: r.language });
   }
+  for (const p of proposals) if (!GATE_ACTIONS.includes(p.op as any)) block(`Agent proposed '${p.op}', which the gate can never do`);
   const secrets = input.flatMap(f => f.content === null ? [] : scanSecrets(f.path, f.content)).concat(scanSecrets("commit message", req.message ?? ""));
   if (secrets.length) block(`Possible secrets found: ${[...new Set(secrets.map(s => `${s.kind} in ${s.path}:${s.line}`))].slice(0, 5).join(", ")}`);
 

@@ -10,7 +10,8 @@ import { randomUUID } from "node:crypto";
 import { PolicyEngine, loadPolicies, type ActionRequest } from "@deploybug/policy";
 import { InjectionChecker, loadModels } from "@deploybug/checker";
 import { providerRegistry } from "@deploybug/providers";
-import { WorkerFactory } from "@deploybug/workers";
+import { WorkerFactory, reviewPush } from "@deploybug/workers";
+import { resolveProvider } from "@deploybug/checker";
 import { FileVault, ProfileStore, type CredentialStore } from "@deploybug/vault";
 import { factsFromRequest, summarizeTicket, templateAlert, formatTime } from "@deploybug/summarizer";
 import { createQueue } from "@deploybug/queue";
@@ -145,8 +146,10 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     const req = await c.req.json<PushRequest>();
     const pol = (policy.policies as any).push;
     if (!pol) return c.json({ error: "push policy not configured" }, 500);
-    const a = await analysePush(req, pol, checker, models.escalateBelow);
-    const summary = { verdict: a.verdict, reasons: a.reasons, files: a.files, gateChanges: a.gateChanges, score: a.score, scanModel: a.scanModel, secrets: a.secrets };
+    const rp = resolveProvider(models, models.brain.provider);
+    const agentReview = await reviewPush(rp.key && rp.base ? { model: models.brain.model, key: rp.key, base: rp.base } : undefined, req.files ?? [], req.message ?? "");
+    const a = await analysePush(req, pol, checker, models.escalateBelow, agentReview.proposals);
+    const summary = { agent: agentReview.summary, verdict: a.verdict, reasons: a.reasons, files: a.files, gateChanges: a.gateChanges, score: a.score, scanModel: a.scanModel, secrets: a.secrets };
     if (a.verdict === "block") { log({ push: req.repo, branch: req.branch, ...summary }); return c.json(summary, 403); }
     if (a.verdict === "approve") {
       const t: Ticket = { id: randomUUID().slice(0, 8), summary: "", createdAt: Date.now(), status: "pending", payload: { kind: "push", req: { ...req, files: undefined, diff: undefined }, files: a.sanitized, ticket: "" } };

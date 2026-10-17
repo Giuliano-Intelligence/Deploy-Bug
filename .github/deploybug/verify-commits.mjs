@@ -4,7 +4,8 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 const git = (...a) => execFileSync("git", a, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
 const key = process.env.DEPLOYBUG_SIGNING_KEY ?? "";
 const repo = process.env.GITHUB_REPOSITORY ?? "";
-const branch = process.env.GITHUB_HEAD_REF || process.env.GITHUB_REF_NAME || "";
+const ref = process.env.GITHUB_BASE_REF || process.env.GITHUB_REF_NAME || "";
+const branch = ref.match(/^deploybug\/stage\/(.+)\/[^/]+$/)?.[1] ?? ref;
 const [from, to] = [process.env.RANGE_FROM ?? "", process.env.RANGE_TO ?? "HEAD"];
 
 if (!key) {
