@@ -40,3 +40,4 @@ export class WorkerFactory {
 }
 export * from "./consensus.ts";
 export * from "./toolkits.ts";
+export * from "./pool.ts";

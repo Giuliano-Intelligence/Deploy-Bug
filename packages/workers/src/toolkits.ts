@@ -1,10 +1,11 @@
 import { runAppAgent, type AgentModel } from "./agent.ts";
+import type { AgentPool } from "./pool.ts";
 
 export const KNOWN_TOOLKITS = ["github", "stripe", "sentry", "mux", "slack", "linear", "notion", "vercel"];
 
 export class ToolkitAgents {
   private connected = new Set<string>();
-  constructor(private model: () => AgentModel | undefined) {}
+  constructor(private model: () => AgentModel | undefined, private pool?: () => AgentPool | undefined) {}
   sync(counts: Record<string, number>) { for (const [k, n] of Object.entries(counts)) if (n > 0) this.connected.add(k.toLowerCase()); return this.list(); }
   list() { return [...this.connected].sort().map(t => `${t}-agent`); }
   has(t: string) { return this.connected.has(t.toLowerCase()); }
@@ -16,6 +17,8 @@ export class ToolkitAgents {
   async handle(ev: any) {
     const t = this.toolkitOf(ev);
     if (!t) return { routed: false, reason: "no connected toolkit matches this event" };
+    const pool = this.pool?.();
+    if (pool && process.env.DRY_RUN !== "1") { const r = await pool.step("tool_worker", `Tool ${t} event:\n${JSON.stringify(ev).slice(0, 6000)}`, t); return { routed: true, agent: r.id, summary: r.out, proposals: [] }; }
     const m = this.model();
     if (!m || process.env.DRY_RUN === "1") return { routed: true, agent: `${t}-agent`, summary: "agent run skipped (dry run)", proposals: [] };
     const r = await runAppAgent({ app: t, model: m, readTools: [], instruction: `A ${t} event arrived. Summarise it and propose nothing unless a gate action applies. Event: ${JSON.stringify(ev).slice(0, 6000)}`,

@@ -35,8 +35,8 @@ test("voters run with separate inputs only", async () => {
   assert.deepEqual(seen, [["push", "subject"], ["push", "subject"]]);
 });
 
-const blockAll = { voters: [vote("block"), vote("block")] as any, judge: judgeOk };
-const g = buildGate({ notifier: new TelegramNotifier(undefined), consensus: blockAll, connect: async tk => Object.fromEntries(tk.map(t => [t, { status: "initiated", redirect_url: `https://connect.composio.dev/link/lk_${t}` }])) });
+const blockAll = async () => JSON.stringify({ verdict: "block", reasoning: "same", ok: true });
+const g = buildGate({ notifier: new TelegramNotifier(undefined), runner: blockAll, store: new (await import("@deploybug/workers")).ResultStore(`/tmp/db-runs-${process.pid}`), connect: async tk => Object.fromEntries(tk.map(t => [t, { status: "initiated", redirect_url: `https://connect.composio.dev/link/lk_${t}` }])) });
 const auth = { authorization: "Bearer gt", "content-type": "application/json" };
 
 test("refund requests go through the consensus panel and policy still applies", async () => {

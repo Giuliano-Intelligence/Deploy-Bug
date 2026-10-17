@@ -13,14 +13,14 @@ import { randomUUID } from "node:crypto";
 import { PolicyEngine, loadPolicies, type ActionRequest } from "@deploybug/policy";
 import { InjectionChecker, loadModels } from "@deploybug/checker";
 import { providerRegistry } from "@deploybug/providers";
-import { WorkerFactory, reviewPush, consensus, agentVoter, agentJudge, ToolkitAgents, KNOWN_TOOLKITS, type Voter, type Judge } from "@deploybug/workers";
+import { WorkerFactory, reviewPush, AgentPool, ResultStore, tribunal, deepagentRunner, type StepRunner, ToolkitAgents, KNOWN_TOOLKITS, type Voter, type Judge } from "@deploybug/workers";
 import { resolveProvider } from "@deploybug/checker";
 import { FileVault, ProfileStore, type CredentialStore } from "@deploybug/vault";
 import { factsFromRequest, summarizeTicket, templateAlert, formatTime } from "@deploybug/summarizer";
 import { createQueue } from "@deploybug/queue";
 import { TelegramNotifier, type Ticket } from "@deploybug/notifier";
 
-export function buildGate(opts: { notifier?: TelegramNotifier; vault?: CredentialStore; media?: MuxMedia; consensus?: { voters: [Voter, Voter]; judge: Judge }; connect?: (toolkits: string[]) => Promise<Record<string, any>>; rollback?: { source: RollbackSource; ops: StageOps; wait?: { tries: number; ms: number } }; redeploy?: (repo: string) => Promise<unknown> } = {}) {
+export function buildGate(opts: { notifier?: TelegramNotifier; vault?: CredentialStore; media?: MuxMedia; runner?: StepRunner; store?: ResultStore; connect?: (toolkits: string[]) => Promise<Record<string, any>>; rollback?: { source: RollbackSource; ops: StageOps; wait?: { tries: number; ms: number } }; redeploy?: (repo: string) => Promise<unknown> } = {}) {
   const media = opts.media ?? new MuxMedia();
   const vault = opts.vault ?? new FileVault();
   const profiles = new ProfileStore();
@@ -112,26 +112,28 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
   }
 
   const ep = (prov: string, model: string) => { const r = resolveProvider(models, prov); return r.key && r.base ? { model, key: r.key, base: r.base } : undefined; };
-  const panel = (() => {
-    if (opts.consensus) return opts.consensus;
+  const runner = (() => {
+    if (opts.runner) return opts.runner;
     if (process.env.DRY_RUN === "1" || process.env.CONSENSUS === "0") return undefined;
     const v = ep(models.brain.provider, models.brain.model), j = ep("openrouter", process.env.DECISION_MODEL ?? "z-ai/glm-5.3");
-    return v && j ? { voters: [agentVoter(v, "a"), agentVoter(v, "b")] as [Voter, Voter], judge: agentJudge(j) } : undefined;
+    return v && j ? deepagentRunner(role => role === "investigator" || role === "judge" ? j : v) : undefined;
   })();
+  const store = opts.store ?? new ResultStore();
+  const newPool = () => runner ? new AgentPool(runner) : undefined;
   async function critical(kind: string, subject: string, user?: string) {
-    if (!panel) return undefined;
-    const r = await consensus(kind, subject, panel.voters, panel.judge, 5);
+    const pool = newPool();
+    if (!pool) return undefined;
+    const r = await tribunal(pool, store, kind, subject, 5);
+    let ticketId: string | undefined;
     if (r.ticket) {
-      const t: Ticket = { id: randomUUID().slice(0, 8), summary: `${kind} check failed: ${r.why}`, createdAt: Date.now(), status: "denied", payload: { kind: "consensus", subject: subject.slice(0, 500) } as any };
-      tickets.set(t.id, t);
-      await notifier.sendAlert(templateAlert(`${kind}-consensus`, new Error(r.why), t.id, tzOf(user))).catch(() => {});
-      log({ consensus: kind, ticket: t.id, attempts: r.attempts });
-      return { ...r, ticketId: t.id };
+      const t: Ticket = { id: randomUUID().slice(0, 8), summary: `${kind} check ${r.path === "exhausted" ? "could not reach agreement" : "found a compromised checker"} (run ${r.runId})`, createdAt: Date.now(), status: "denied", payload: { kind: "tribunal", runId: r.runId } as any };
+      tickets.set(t.id, t); ticketId = t.id;
+      await notifier.sendAlert(templateAlert(`${kind}-tribunal`, new Error(t.summary), t.id, tzOf(user))).catch(() => {});
     }
-    log({ consensus: kind, verdict: r.verdict, attempts: r.attempts });
-    return r;
+    log({ tribunal: kind, run: r.runId, verdict: r.verdict, path: r.path, attempts: r.attempts, ticket: ticketId });
+    return { ...r, ticketId };
   }
-  const toolkitAgents = new ToolkitAgents(() => ep(models.brain.provider, models.brain.model));
+  const toolkitAgents = new ToolkitAgents(() => ep(models.brain.provider, models.brain.model), newPool);
   const connectFn = opts.connect ?? (async (toolkits: string[]) => {
     const cred = await vault.get(process.env.OWNER_USER ?? "owner", "composio");
     const key = cred?.apiKey ?? (existsSync("/tmp/keys/composio") ? readFileSync("/tmp/keys/composio", "utf8").trim() : "");
@@ -183,6 +185,26 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     log({ rollback: b.repo, ticket: t.id });
     return c.json({ verdict: "pending_approval", ticket: t.id, telegram: sent && !(sent as any).skipped, message: t.summary }, 202);
   });
+  async function autoRollback(repo: string, branch: string, evidence: string, user?: string) {
+    const pol = (policy.policies as any).push;
+    if (!pol?.repos?.includes(repo)) return { rolledBack: false, reason: "repo not managed" };
+    const id = `auto-${randomUUID().slice(0, 8)}`;
+    let result: any;
+    try { result = await rollbackNow({ repo, branch, ticket: id }); } catch (e) { result = { pushed: false, error: String(e) }; }
+    log({ autoRollback: repo, branch, ticket: id, result });
+    await notifier.sendAlert(templateAlert("auto-rollback", new Error(`Hack or injection detected on ${repo} ${branch}. Rolled back automatically: ${result?.pushed ? "yes" : "no"}. Evidence: ${evidence.slice(0, 160)}`), id, tzOf(user))).catch(() => {});
+    return { rolledBack: !!result?.pushed, ticket: id, result };
+  }
+  app.post("/incident", async c => {
+    if (!ownerOk(c) && !(token && c.req.header("authorization") === `Bearer ${token}`)) return c.json({ error: "unauthorized" }, 401);
+    const b = await c.req.json<{ repo: string; branch?: string; evidence: string }>();
+    const check = await checker.check(String(b.evidence ?? "").slice(0, 16000));
+    const t = await critical("injection", String(b.evidence ?? ""));
+    const hacked = t ? t.verdict === "block" : check.score < models.escalateBelow;
+    if (!hacked) return c.json({ hacked: false, score: check.score, tribunal: t && { run: t.runId, path: t.path } });
+    return c.json({ hacked: true, score: check.score, tribunal: t && { run: t.runId, path: t.path }, ...(await autoRollback(b.repo, b.branch ?? "main", String(b.evidence))) });
+  });
+  app.get("/runs/pending", c => ownerOk(c) ? c.json(store.pending().map((r: any) => ({ id: r.id, kind: r.kind, verdict: r.verdict, path: r.path }))) : c.json({ error: "unauthorized" }, 401));
   app.post("/composio/events", async c => {
     const secret = process.env.COMPOSIO_WEBHOOK_SECRET;
     const raw = await c.req.text();
@@ -193,7 +215,13 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     } else if (!ownerOk(c)) return c.json({ error: "unauthorized" }, 401);
     let ev: any; try { ev = JSON.parse(raw); } catch { return c.json({ error: "bad json" }, 400); }
     const check = await checker.check(raw.slice(0, 16000));
-    if (check.score < models.escalateBelow) { log({ composioEvent: "blocked", score: check.score }); return c.json({ routed: false, reason: "event looks like a prompt-injection attempt" }, 403); }
+    if (check.score < models.escalateBelow) {
+      log({ composioEvent: "blocked", score: check.score });
+      const repo = ev?.repository?.full_name ?? ev?.data?.repository?.full_name;
+      const ref = String(ev?.ref ?? ev?.data?.ref ?? "");
+      const live = repo && /^refs\/heads\//.test(ref) ? await autoRollback(repo, ref.replace("refs/heads/", ""), raw.slice(0, 400)) : undefined;
+      return c.json({ routed: false, reason: "event looks like a prompt-injection attempt", rollback: live }, 403);
+    }
     return c.json(await toolkitAgents.handle(ev));
   });
   app.use("/media/*", cors({ origin: "*", allowMethods: ["GET", "OPTIONS"], allowHeaders: ["Authorization"] }));
@@ -224,7 +252,7 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     if (d.verdict === "block") { log({ req, ...d, check }); return c.json({ ...d, check }, 403); }
     const kind = /REFUND/i.test(req.tool ?? "") ? "refund" : check.score < 85 ? "injection" : undefined;
     const cons = kind ? await critical(kind, `${req.app}.${req.tool}\n${text}`, req.user) : undefined;
-    if (cons && cons.verdict === "block") return c.json({ verdict: "block", reason: cons.ticket ? "The two independent checkers could not agree, so it was blocked and a ticket was raised" : "Both independent checkers blocked this", consensus: { attempts: cons.attempts, ticket: (cons as any).ticketId } }, 403);
+    if (cons && cons.verdict === "block") return c.json({ verdict: "block", reason: cons.ticket ? "The two independent checkers could not agree, so it was blocked and a ticket was raised" : "Both independent checkers blocked this", tribunal: { run: cons.runId, path: cons.path, attempts: cons.attempts, ticket: cons.ticketId } }, 403);
     if (d.verdict === "approve") {
       const t: Ticket = { id: randomUUID().slice(0, 8), summary: `${req.agent ?? "agent"} → ${req.app}.${req.tool}\n${JSON.stringify(req.args)}\n${d.reason}`, createdAt: Date.now(), status: "pending", payload: req };
       tickets.set(t.id, t);
