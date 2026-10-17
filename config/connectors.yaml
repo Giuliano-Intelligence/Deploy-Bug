@@ -1,0 +1,18 @@
+connectors:
+  - { slug: github, name: GitHub, via: composio, category: code }
+  - { slug: supabase, name: Supabase, via: composio, category: database }
+  - { slug: neon, name: Neon, via: composio, category: database }
+  - { slug: clerk, name: Clerk, via: composio, category: auth }
+  - { slug: aws, name: AWS, via: composio, category: cloud }
+  - { slug: cloudflare, name: Cloudflare, via: composio, category: cloud }
+  - { slug: render, name: Render, via: composio, category: hosting }
+  - { slug: netlify, name: Netlify, via: composio, category: hosting }
+  - { slug: railway, name: Railway, via: composio, category: hosting }
+  - { slug: upstash, name: Upstash, via: composio, category: database }
+  - { slug: resend, name: Resend, via: composio, category: email }
+  - { slug: posthog, name: PostHog, via: composio, category: analytics }
+  - { slug: linear, name: Linear, via: composio, category: tickets }
+  - { slug: stripe, name: Stripe, via: composio, category: payments }
+  - { slug: sentry, name: Sentry, via: composio, category: monitoring }
+  - { slug: mux, name: Mux, via: composio, category: video }
+  - { slug: aikido, name: Aikido Security, via: custom_mcp, category: security, mcp: "@aikidosec/mcp", auth: API_KEY }

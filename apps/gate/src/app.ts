@@ -15,7 +15,7 @@ import { randomUUID } from "node:crypto";
 import { PolicyEngine, loadPolicies, type ActionRequest } from "@deploybug/policy";
 import { InjectionChecker, loadModels } from "@deploybug/checker";
 import { providerRegistry } from "@deploybug/providers";
-import { WorkerFactory, reviewPush, AgentPool, ResultStore, tribunal, deepagentRunner, type StepRunner, ToolkitAgents, KNOWN_TOOLKITS, type Voter, type Judge } from "@deploybug/workers";
+import { WorkerFactory, reviewPush, AgentPool, ResultStore, tribunal, deepagentRunner, type StepRunner, ToolkitAgents, KNOWN_TOOLKITS, CONNECTORS, type Voter, type Judge } from "@deploybug/workers";
 import { resolveProvider } from "@deploybug/checker";
 import { FileVault, ProfileStore, type CredentialStore } from "@deploybug/vault";
 import { factsFromRequest, summarizeTicket, templateAlert, formatTime } from "@deploybug/summarizer";
@@ -169,9 +169,14 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     if (!ownerOk(c) && !codes.consume(c.req.query("c"))) return c.text("unauthorized", 401);
     const picked = (c.req.query("toolkits") ?? "").split(",").map(x => x.trim().toLowerCase()).filter(x => /^[a-z0-9_]+$/.test(x));
     const esc = (x: string) => x.replace(/[&<>"']/g, ch => `&#${ch.charCodeAt(0)};`);
-    if (!picked.length) return c.html(`<!doctype html><meta name=viewport content="width=device-width"><title>Connect</title><h2>Connect your tools</h2><form method=get><input type=hidden name=c value="${codes.issue()}">${KNOWN_TOOLKITS.map(k => `<label style="display:block;font-size:1.3em;margin:.5em 0"><input type=checkbox name=tk value=${k}> ${k}</label>`).join("")}<button style="font-size:1.3em">Get links</button></form><script>document.forms[0].onsubmit=e=>{e.preventDefault();const f=new FormData(e.target);location.search="?c="+encodeURIComponent(f.get("c"))+"&toolkits="+f.getAll("tk").join(",")}</script>`);
+    if (!picked.length) return c.html(`<!doctype html><meta name=viewport content="width=device-width"><title>Connect</title><h2>Connect your tools</h2><form method=get><input type=hidden name=c value="${codes.issue()}">${CONNECTORS.map(k => `<label style="display:block;font-size:1.3em;margin:.5em 0"><input type=checkbox name=tk value=${k.slug}> ${esc(k.name)} <small>${esc(k.category)}${k.via === "custom_mcp" ? " · custom MCP" : ""}</small></label>`).join("")}<button style="font-size:1.3em">Get links</button></form><script>document.forms[0].onsubmit=e=>{e.preventDefault();const f=new FormData(e.target);location.search="?c="+encodeURIComponent(f.get("c"))+"&toolkits="+f.getAll("tk").join(",")}</script>`);
     try {
-      const res = await connectFn(picked);
+      const known = new Map(CONNECTORS.map(k => [k.slug, k]));
+      const custom = picked.filter(p => known.get(p)?.via === "custom_mcp");
+      const viaComposio = picked.filter(p => known.get(p)?.via === "composio");
+      const res: Record<string, any> = viaComposio.length ? { ...(await connectFn(viaComposio)) } : {};
+      for (const k of custom) res[k] = { status: "needs_setup", note: "Custom MCP: register its HTTPS endpoint in Composio with API_KEY auth, then connect" };
+      for (const p of picked.filter(p => !known.has(p))) res[p] = { status: "not_in_catalog" };
       const links = Object.entries(res).map(([k, v]: any) => ({ toolkit: k, status: v.status, url: v.redirect_url }));
       if (c.req.header("accept")?.includes("application/json")) return c.json({ links });
       return c.html(`<!doctype html><meta name=viewport content="width=device-width"><h2>Tap each to connect</h2>${links.map(l => l.url ? `<p style="font-size:1.3em"><a href="${esc(l.url)}">Connect ${esc(l.toolkit)}</a></p>` : `<p>${esc(l.toolkit)}: ${esc(String(l.status))}</p>`).join("")}<p>Links expire in 10 minutes.</p>`);
@@ -186,6 +191,7 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     }
     return c.json({ agents: toolkitAgents.sync(counts) });
   });
+  app.get("/connect/catalog", c => principal(c) ? c.json(CONNECTORS) : c.json({ error: "unauthorized" }, 401));
   app.get("/connect/agents", c => ownerOk(c) ? c.json({ agents: toolkitAgents.list() }) : c.json({ error: "unauthorized" }, 401));
   app.post("/rollback", async c => {
     if (!isAgentOrOwner(c)) return c.json({ error: "unauthorized" }, 401);
@@ -258,7 +264,7 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
       const live = secret && t && t.verdict === "block" && t.path !== "exhausted" && repo && /^refs\/heads\//.test(ref) ? await autoRollback(repo, ref.replace("refs/heads/", ""), raw.slice(0, 400)) : undefined;
       return c.json({ routed: false, reason: "event looks like a prompt-injection attempt", rollback: live }, 403);
     }
-    return c.json(await toolkitAgents.handle(ev));
+    return c.json(await queue.add(`toolkit:event`, () => toolkitAgents.handle(ev)));
   });
   app.use("/media/*", cors({ origin: "*", allowMethods: ["GET", "OPTIONS"], allowHeaders: ["Authorization"] }));
   app.get("/media/current", async c => {

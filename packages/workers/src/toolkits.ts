@@ -1,7 +1,15 @@
 import { runAppAgent, type AgentModel } from "./agent.ts";
 import type { AgentPool } from "./pool.ts";
 
-export const KNOWN_TOOLKITS = ["github", "stripe", "sentry", "mux", "slack", "linear", "notion", "vercel"];
+import { readFileSync } from "node:fs";
+import { parse } from "yaml";
+
+export interface Connector { slug: string; name: string; via: "composio" | "custom_mcp"; category: string; mcp?: string; auth?: string }
+export function loadConnectors(path = process.env.CONNECTORS_FILE ?? "config/connectors.yaml"): Connector[] {
+  try { return ((parse(readFileSync(path, "utf8")) as any)?.connectors ?? []).filter((c: any) => /^[a-z0-9_]+$/.test(c?.slug ?? "") && c.slug !== "vercel"); } catch { return []; }
+}
+export const CONNECTORS = loadConnectors();
+export const KNOWN_TOOLKITS = CONNECTORS.map(c => c.slug);
 
 export class ToolkitAgents {
   private connected = new Set<string>();
