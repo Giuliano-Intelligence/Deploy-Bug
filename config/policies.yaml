@@ -1,0 +1,64 @@
+# Per-app policy. One worker is created per app listed here (idle until a request arrives).
+# access: read | write | both. Tools not listed in `tools` are never exposed to that app's worker.
+apps:
+  stripe:
+    provider: composio
+    access: both
+    tools:
+      - { name: STRIPE_LIST_CHARGES, kind: read }
+      - { name: STRIPE_CREATE_REFUND, kind: write }
+    rules:
+      refund:
+        tool: STRIPE_CREATE_REFUND
+        maxAmountMinor: 2000        # £20.00
+        currency: gbp
+        oncePerCustomer: true
+        singleChargeOnly: true
+        requireApprovalAboveMinor: 0 # every refund needs a Telegram approval
+  github:
+    provider: composio
+    access: read
+    tools:
+      - { name: GITHUB_GET_A_REPOSITORY, kind: read }
+      - { name: GITHUB_GET_A_PULL_REQUEST, kind: read }
+      - { name: GITHUB_LIST_REVIEW_COMMENTS_ON_A_PULL_REQUEST, kind: read }
+  sentry:
+    provider: composio
+    access: read
+    tools:
+      - { name: SENTRY_LIST_ORGANIZATION_PROJECTS, kind: read }
+      - { name: SENTRY_LIST_AN_ORGANIZATIONS_ISSUES, kind: read }
+  # Optional: BugFlix plays its film itself, so Mux is off by default. Set enabled: true to add a mux-worker.
+  mux:
+    enabled: false
+    provider: mux
+    access: read
+    tools:
+      - { name: MUX_GET_PLAYBACK_INFO, kind: read }
+
+# Input sources (GitHub webhook ingest). trust: trusted | untrusted.
+# CodeRabbit is a recommended companion (PR review + security). Its comments are trusted findings and are not scanned,
+# but only when login + type match AND the webhook is signed (GITHUB_WEBHOOK_SECRET). Otherwise they are scanned like anyone else.
+# blockDeployOn: severities that block GET /deploy/status until resolved. Use [] to never block.
+sources:
+  coderabbit:
+    trust: trusted
+    login: "coderabbitai[bot]"
+    userType: Bot
+    severity:
+      critical: "(🔴|🛑|\\bcritical\\b|security vulnerab)"
+      major: "(🟠|\\bmajor\\b|potential issue)"
+    blockDeployOn: [critical]
+  default:
+    trust: untrusted
+
+# Gated push pipeline (POST /push). Agents never hold GitHub credentials.
+push:
+  repos: ["GiulianoIntelligence/BugFlix", "GiulianoIntelligence/Deploy-Bug"]
+  branches: ["main", "deploybug/*", "feature/*", "fix/*"]
+  protectedBranches: ["main"]
+  alwaysRequireApproval: false
+  keepLicenseHeaders: true
+  stripConfigComments: false
+  maxFiles: 50
+  maxFileBytes: 200000

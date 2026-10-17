@@ -1,0 +1,27 @@
+# Model config. Providers are OpenAI-compatible endpoints; keys: env var first, then keyFile (never committed).
+providers:
+  redpill:    { baseUrlEnv: REDPILL_BASE_URL,    baseUrlDefault: "https://api.redpill.ai/v1",    apiKeyEnv: REDPILL_API_KEY,    apiKeyFile: /tmp/keys/redpill }
+  openrouter: { baseUrlEnv: OPENROUTER_BASE_URL, baseUrlDefault: "https://openrouter.ai/api/v1", apiKeyEnv: OPENROUTER_API_KEY, apiKeyFile: /tmp/keys/openrouter }
+
+# Worker brain
+brain: { provider: redpill, model: deepseek/deepseek-v4.1-flash }
+
+# Stage 1: run in parallel. kind=guard parses "safe"/"unsafe" text; kind=score parses {"score":0-100}.
+panel:
+  - { id: nemotron-safety, provider: openrouter, model: "nvidia/nemotron-3.5-content-safety:free", kind: guard, weight: 1, timeoutMs: 8000 }
+  - { id: gpt-oss-safeguard, provider: openrouter, model: openai/gpt-oss-safeguard-20b, kind: score, weight: 1, timeoutMs: 8000, reasoning: low }
+  - { id: llama-guard-4, provider: openrouter, model: meta-llama/llama-guard-4-12b, kind: guard, weight: 1, timeoutMs: 8000 }
+  - { id: deepseek-scorer, provider: redpill, model: deepseek/deepseek-v4.1-flash, kind: score, weight: 2, timeoutMs: 10000 }
+
+# Stage 2: aggregate < escalateBelow -> decision model has the final say (tested: GLM-5.3 reliable; nemotron-3-ultra obeyed the injection).
+escalateBelow: 80
+escalation: { id: glm-5.3, provider: openrouter, model: z-ai/glm-5.3, kind: score, timeoutMs: 15000, reasoning: low }
+
+# Telegram summarizer: 2 sets x 2 independent summarizers; decision model checks the pair agrees on facts.
+summarizer:
+  sets:
+    - [ { id: s1a, provider: redpill, model: deepseek/deepseek-v4.1-flash, timeoutMs: 10000 }, { id: s1b, provider: redpill, model: deepseek/deepseek-v4.1-flash, timeoutMs: 10000 } ]
+    - [ { id: s2a, provider: redpill, model: deepseek/deepseek-v4.1-flash, timeoutMs: 10000 }, { id: s2b, provider: redpill, model: deepseek/deepseek-v4.1-flash, timeoutMs: 10000 } ]
+  judge: { id: judge, provider: openrouter, model: z-ai/glm-5.3, timeoutMs: 15000, reasoning: low }
+  maxLoops: 5
+  totalTimeoutMs: 60000
