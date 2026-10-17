@@ -6,7 +6,7 @@ const { buildGate } = await import("../apps/gate/src/app.ts");
 const { GateStore } = await import("../apps/gate/src/persist.ts");
 const { TelegramNotifier } = await import("@deploybug/notifier");
 test("dashboard needs a one-time code, data stays private", async () => {
-  const g = buildGate({ notifier: new TelegramNotifier(undefined), gateStore: new GateStore(`/tmp/db-ui-${process.pid}`) });
+  const g = buildGate({ notifier: new TelegramNotifier(undefined), connect: async (t: string[]) => Object.fromEntries(t.map(x => [x, { status: "initiated", redirect_url: `https://connect.composio.dev/link/${x}` }])), gateStore: new GateStore(`/tmp/db-ui-${process.pid}`) });
   assert.equal((await g.app.request("/")).status, 200);
   assert.equal((await g.app.request("/ui/data")).status, 401);
   assert.equal((await g.app.request("/ui/data", { headers: { authorization: "Bearer agent-token-0123456789abcdef" } })).status, 401);
@@ -18,4 +18,10 @@ test("dashboard needs a one-time code, data stays private", async () => {
   const d: any = await (await g.app.request("/ui/data", { headers: { cookie } })).json();
   assert.ok(d.connectors.length > 10);
   assert.equal((await g.app.request(`/?c=${code}`)).status, 401);
+  assert.equal((await g.app.request("/ui/connect/github", { method: "POST" })).status, 401);
+  assert.equal((await g.app.request("/ui/connect/github", { method: "POST", headers: { cookie, origin: "https://evil.example" } })).status, 403);
+  const gh: any = await (await g.app.request("/ui/connect/github", { method: "POST", headers: { cookie } })).json();
+  assert.equal(gh.url, "https://connect.composio.dev/link/github");
+  const ex: any = await (await g.app.request("/ui/connect/expo", { method: "POST", headers: { cookie } })).json();
+  assert.equal(ex.setup.auth, "DCR_OAUTH");
 });

@@ -11,6 +11,8 @@ header{display:flex;align-items:center;gap:10px;margin-bottom:18px}header img{wi
 .kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.kpi{border:1px solid #262626;border-radius:12px;padding:10px}.kpi b{display:block;font-size:22px}.kpi span{color:#8a8a8a;font-size:12px}
 .row{display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-top:1px solid #1a1a1a}.row:first-of-type{border-top:0}.muted{color:#8a8a8a}.pill{border:1px solid #fff;border-radius:999px;padding:1px 8px;font-size:12px;white-space:nowrap}.pill.dim{border-color:#444;color:#8a8a8a}
 .chips{display:flex;flex-wrap:wrap;gap:6px}.chip{border:1px solid #333;border-radius:999px;padding:4px 10px;font-size:13px}.chip.on{background:#fff;color:#000;border-color:#fff}
+button.chip{min-height:44px;min-width:44px;padding:0 14px;background:#0a0a0a;color:#fff;font:inherit;font-size:14px;cursor:pointer;display:inline-flex;align-items:center;gap:6px}button.chip:active{background:#1a1a1a}button.chip.on{background:#fff;color:#000}button.chip small{font-size:11px;opacity:.7}
+#sheet{position:fixed;inset:auto 0 0 0;background:#0a0a0a;border-top:1px solid #333;border-radius:18px 18px 0 0;padding:18px 18px max(18px,env(safe-area-inset-bottom))}#sheet ol{padding-left:18px}#sheet code{word-break:break-all;background:#1a1a1a;padding:2px 6px;border-radius:6px}#sheet button{min-height:44px;width:100%;border-radius:12px;border:1px solid #fff;background:#fff;color:#000;font:inherit;margin-top:8px}
 #login{max-width:420px;margin:20vh auto;text-align:center}#login p{color:#8a8a8a}
 </style></head><body>
 <div id="login" hidden><img src="/icon.svg" width="56" alt=""><h1>Deploy Bug</h1><p>Open the one-time link from your phone to sign in.</p></div>
@@ -21,7 +23,7 @@ header{display:flex;align-items:center;gap:10px;margin-bottom:18px}header img{wi
 <section class="card"><h2>Connectors</h2><div class="chips" id="conn"></div></section>
 <section class="card"><h2>Tickets</h2><div id="tickets"></div></section>
 <section class="card"><h2>Recent activity</h2><div id="audit"></div></section>
-</div></main>
+</div></main><div id="sheet" hidden></div>
 <script>
 const $=id=>document.getElementById(id);const esc=s=>String(s??"").replace(/[&<>"']/g,c=>"&#"+c.charCodeAt(0)+";");
 const row=(a,b,dim)=>'<div class="row"><span>'+a+'</span><span class="pill'+(dim?' dim':'')+'">'+b+'</span></div>';
@@ -29,7 +31,11 @@ fetch("/ui/data",{credentials:"same-origin"}).then(r=>{if(!r.ok)throw 0;return r
 $("app").hidden=false;$("sub").textContent=d.workers.length+" workers · "+d.models.brain;
 $("k-pending").textContent=d.tickets.filter(t=>t.status==="pending").length;$("k-queue").textContent=d.queue.running+"/"+d.queue.concurrency;$("k-runs").textContent=d.runs.length;
 $("mode").textContent=d.dryRun?"dry run":"live";$("tg").textContent=d.telegram?"connected":"off";
-$("conn").innerHTML=d.connectors.map(c=>'<span class="chip'+(d.connected.includes(c.slug)?' on':'')+'">'+esc(c.name)+'</span>').join("");
+$("conn").innerHTML=d.connectors.map(c=>{const on=d.connected.includes(c.slug);return '<button class="chip'+(on?' on':'')+'" data-slug="'+esc(c.slug)+'" data-via="'+esc(c.via)+'">'+esc(c.name)+(on?' <small>Connected</small>':c.via==="custom_mcp"?' <small>setup</small>':'')+'</button>'}).join("");
+$("conn").onclick=async e=>{const b=e.target.closest("button[data-slug]");if(!b)return;const custom=b.dataset.via==="custom_mcp";const w=custom?null:window.open("about:blank","_blank");
+const r=await fetch("/ui/connect/"+encodeURIComponent(b.dataset.slug),{method:"POST",credentials:"same-origin"});const j=await r.json().catch(()=>({}));
+if(j.url){if(w)w.location=j.url;else location.href=j.url;return}if(w)w.close();
+const s=$("sheet");if(j.setup){s.innerHTML='<h2 style="margin:0 0 8px">'+esc(j.setup.name)+' setup</h2><p class="muted">Endpoint <code>'+esc(j.setup.mcp)+'</code> · '+esc(j.setup.auth)+'</p><ol>'+j.setup.steps.map(x=>'<li>'+esc(x)+'</li>').join("")+'</ol><button id="x">Done</button>'}else{s.innerHTML='<p>'+esc(j.status||j.error||"Could not create a link")+'</p><button id="x">Close</button>'}s.hidden=false;$("x").onclick=()=>s.hidden=true};
 $("tickets").innerHTML=d.tickets.slice(0,12).map(t=>row(esc((t.summary||"").split("\\n")[0].slice(0,60)),esc(t.status),t.status!=="pending")).join("")||'<p class="muted">No tickets</p>';
 $("audit").innerHTML=d.audit.slice(0,12).map(a=>row(esc(a.verdict||a.status||Object.keys(a).filter(k=>k!=="at")[0]),esc(new Date(a.at).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})),true)).join("")||'<p class="muted">Nothing yet</p>';
 }).catch(()=>{$("login").hidden=false});

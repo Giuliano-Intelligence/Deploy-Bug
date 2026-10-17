@@ -203,6 +203,19 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
       tickets: [...tickets.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, 30).map(t => ({ id: t.id, status: t.status, summary: t.summary.slice(0, 200), createdAt: t.createdAt })),
       runs: store.pending().map((r: any) => ({ id: r.id, kind: r.kind, verdict: r.verdict })), audit: audit.slice(-30).reverse().map(a => ({ at: a.at, verdict: a.verdict, status: a.status, ticket: a.ticket })) });
   });
+  app.post("/ui/connect/:slug", async c => {
+    if (!isOwner(c) && !sessionOk(c)) return c.json({ error: "unauthorized" }, 401);
+    const origin = c.req.header("origin");
+    if (origin && new URL(origin).host !== new URL(c.req.url).host && origin.replace(/^https?:\/\//, "") !== c.req.header("host")) return c.json({ error: "bad origin" }, 403);
+    const k: any = CONNECTORS.find(x => x.slug === c.req.param("slug"));
+    if (!k) return c.json({ error: "not in catalog" }, 404);
+    if (k.via === "custom_mcp") return c.json({ setup: { name: k.name, mcp: k.mcp ?? "", auth: k.auth ?? "API_KEY", steps: ["Open Composio, Custom MCP, Add server", `Paste the endpoint ${k.mcp ?? ""}`, k.auth === "DCR_OAUTH" ? "Pick OAuth and sign in when asked" : "Pick API key auth and paste your key there, never in chat", "Come back and tap Sync"] } });
+    try {
+      const r: any = (await connectFn([k.slug]))[k.slug] ?? {};
+      if (!r.redirect_url) return c.json({ status: r.status ?? "unavailable" }, r.status === "active" ? 200 : 502);
+      return c.json({ url: r.redirect_url });
+    } catch { return c.json({ error: "Composio is not configured" }, 502); }
+  });
   app.get("/status.json", c => c.json({ name: "deploybug-gate", workers: workers.list(), telegram: notifier.enabled, queue: queue.status(), models: { brain: models.brain.model, panel: models.panel.map(m => m.id ?? m.model), escalation: models.escalation?.model } }));
   app.get("/health", c => c.json({ ok: true }));
   const ownerOk = (c: any) => isOwner(c);
