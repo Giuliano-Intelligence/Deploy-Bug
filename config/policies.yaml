@@ -54,7 +54,7 @@ sources:
 
 # Gated push pipeline (POST /push). Agents never hold GitHub credentials.
 push:
-  repos: ["GiulianoIntelligence/BugFlix", "GiulianoIntelligence/Deploy-Bug"]
+  repos: ["Giuliano-Intelligence/BugFlix", "Giuliano-Intelligence/Deploy-Bug", "GiulianoIntelligence/BugFlix", "GiulianoIntelligence/Deploy-Bug"]
   branches: ["main", "deploybug/*", "feature/*", "fix/*"]
   protectedBranches: ["main"]
   alwaysRequireApproval: false
