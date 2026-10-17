@@ -1,7 +1,7 @@
 import { createHash, createHmac } from "node:crypto";
 
-export type GateActionKind = "delete_file" | "remove_dependency" | "strip_comments";
-export const GATE_ACTIONS: readonly GateActionKind[] = ["delete_file", "remove_dependency", "strip_comments"];
+export type GateActionKind = "delete_file" | "remove_dependency" | "strip_comments" | "restore";
+export const GATE_ACTIONS: readonly GateActionKind[] = ["delete_file", "remove_dependency", "strip_comments", "restore"];
 
 export interface GateChange { op: string; path: string; detail?: string }
 export interface FileState { path: string; content: string | null }
@@ -24,13 +24,16 @@ function onlyDependencyRemoved(before: string, after: string, dep: string) {
 
 export class GateActionGuard {
   constructor(private allowed: readonly string[] = GATE_ACTIONS) {
-    for (const a of allowed) if (!GATE_ACTIONS.includes(a as GateActionKind)) throw new Error(`gate action '${a}' can never be enabled: the gate only deletes files, removes dependencies or strips comments`);
+    for (const a of allowed) if (!GATE_ACTIONS.includes(a as GateActionKind)) throw new Error(`gate action '${a}' can never be enabled: the gate only deletes files, removes dependencies, strips comments or restores a prior signed state`);
   }
 
-  verify(change: GateChange, before: FileState, after: FileState): string | undefined {
+  verify(change: GateChange, before: FileState, after: FileState, prior?: FileState): string | undefined {
     if (!this.allowed.includes(change.op)) return `Gate action '${change.op}' isn't allowed`;
     if (before.path !== change.path || after.path !== change.path) return `Gate change path mismatch for ${change.path}`;
     switch (change.op) {
+      case "restore":
+        if (!prior || prior.path !== change.path || !change.detail) return `restore on ${change.path} needs the signed commit it restores from`;
+        return after.content === prior.content ? undefined : `restore on ${change.path} does not match ${change.detail.slice(0, 7)}, so it was rejected`;
       case "delete_file":
         return after.content === null ? undefined : `delete_file on ${change.path} left content behind`;
       case "remove_dependency":

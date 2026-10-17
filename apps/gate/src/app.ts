@@ -2,7 +2,9 @@ import { Hono } from "hono";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { stagedPush, composioStageOps, appStageOps, stageBranch, signedMessage } from "./stage.ts";
+import { runRollback, appRollbackSource, type RollbackSource } from "./rollback.ts";
+import { execFile } from "node:child_process";
+import { stagedPush, composioStageOps, appStageOps, type StageOps, stageBranch, signedMessage } from "./stage.ts";
 import { ComposioConnectMcp, MuxMedia, GitHubAppClient, appConfig } from "@deploybug/providers";
 import { cors } from "hono/cors";
 import { ingestComment } from "./ingest.ts";
@@ -18,7 +20,7 @@ import { factsFromRequest, summarizeTicket, templateAlert, formatTime } from "@d
 import { createQueue } from "@deploybug/queue";
 import { TelegramNotifier, type Ticket } from "@deploybug/notifier";
 
-export function buildGate(opts: { notifier?: TelegramNotifier; vault?: CredentialStore; media?: MuxMedia; consensus?: { voters: [Voter, Voter]; judge: Judge }; connect?: (toolkits: string[]) => Promise<Record<string, any>> } = {}) {
+export function buildGate(opts: { notifier?: TelegramNotifier; vault?: CredentialStore; media?: MuxMedia; consensus?: { voters: [Voter, Voter]; judge: Judge }; connect?: (toolkits: string[]) => Promise<Record<string, any>>; rollback?: { source: RollbackSource; ops: StageOps; wait?: { tries: number; ms: number } }; redeploy?: (repo: string) => Promise<unknown> } = {}) {
   const media = opts.media ?? new MuxMedia();
   const vault = opts.vault ?? new FileVault();
   const profiles = new ProfileStore();
@@ -69,11 +71,33 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     return queue.add(`github:push:${req.repo}`, () => stagedPush(composioStageOps((t, a) => mcp!.execute(t, a, cred!.account), req.repo), { repo: req.repo, target: req.branch, ticket, message: req.message, files, key, perFile: true }));
   }
 
+  const redeploy = opts.redeploy ?? (async (repo: string) => {
+    const project = process.env[`CREATEOS_PROJECT_${repo.split("/")[1].toUpperCase().replace(/[^A-Z0-9]/g, "_")}`];
+    if (!project) return { skipped: true, reason: "no CreateOS project configured for this repo" };
+    return new Promise((res, rej) => execFile("createos", ["deploy", "--project", project], { timeout: 120_000 }, (e, out) => e ? rej(e) : res({ project, out: out.slice(-500) })));
+  });
+  async function rollbackNow(p: { repo: string; branch: string; to?: string; ticket: string }) {
+    let target = opts.rollback;
+    if (!target) {
+      const ghApp = appConfig();
+      if (!ghApp || process.env.DRY_RUN === "1") return { dryRun: true, reason: ghApp ? "DRY_RUN=1" : "GitHub App not configured (DEPLOYBUG_APP_ID)" };
+      const client = new GitHubAppClient(ghApp);
+      const api = (path: string, init?: RequestInit) => client.repoApi(p.repo, path, init);
+      target = { source: appRollbackSource(api), ops: appStageOps(api) };
+    }
+    const t = target;
+    return queue.add(`github:rollback:${p.repo}`, () => runRollback(t.source, t.ops, { ...p, key: signingKey() }, () => redeploy(p.repo), t.wait));
+  }
+
   async function decide(id: string, approve: boolean) {
     const t = tickets.get(id);
     if (!t || t.status !== "pending") return { error: "no pending ticket" };
     t.status = approve ? "approved" : "denied";
     if (!approve) { log({ ticket: id, status: "denied" }); return { status: "denied" }; }
+    if (t.payload.kind === "rollback") {
+      try { const result = await rollbackNow({ ...t.payload, ticket: id }); log({ ticket: id, status: "executed", result }); return { status: "executed", result }; }
+      catch (e) { await notifier.sendAlert(templateAlert("rollback", e, id, tzOf())).catch(() => {}); return { status: "failed", error: String(e) }; }
+    }
     if (t.payload.kind === "push") {
       try { const result = await runPush(t.payload); log({ ticket: id, status: "executed", result }); return { status: "executed", result }; }
       catch (e) { await notifier.sendAlert(templateAlert("github-worker push", e, id, tzOf(t.payload.req.user))).catch(() => {}); return { status: "failed", error: String(e) }; }
@@ -146,6 +170,19 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     return c.json({ agents: toolkitAgents.sync(counts) });
   });
   app.get("/connect/agents", c => ownerOk(c) ? c.json({ agents: toolkitAgents.list() }) : c.json({ error: "unauthorized" }, 401));
+  app.post("/rollback", async c => {
+    if (!ownerOk(c) && !(token && c.req.header("authorization") === `Bearer ${token}`)) return c.json({ error: "unauthorized" }, 401);
+    const b = await c.req.json<{ repo: string; branch?: string; to?: string; reason?: string }>();
+    const pol = (policy.policies as any).push;
+    const branch = b.branch ?? "main";
+    if (!pol?.repos?.includes(b.repo)) return c.json({ error: `${b.repo} isn't on the list of repos` }, 403);
+    if (b.to && !/^[0-9a-f]{7,40}$/.test(b.to)) return c.json({ error: "bad commit id" }, 400);
+    const t: Ticket = { id: randomUUID().slice(0, 8), summary: `Rollback approval needed\nRoll ${b.repo} ${branch} back to ${b.to ? b.to.slice(0, 7) : "the last gate-signed good commit"} and redeploy.\nReason: ${(b.reason ?? "not given").slice(0, 200)}\nTime: ${formatTime(tzOf())}`, createdAt: Date.now(), status: "pending", payload: { kind: "rollback", repo: b.repo, branch, to: b.to } as any };
+    tickets.set(t.id, t);
+    const sent = await notifier.sendApproval(t).catch(e => ({ error: String(e) }));
+    log({ rollback: b.repo, ticket: t.id });
+    return c.json({ verdict: "pending_approval", ticket: t.id, telegram: sent && !(sent as any).skipped, message: t.summary }, 202);
+  });
   app.post("/composio/events", async c => {
     const secret = process.env.COMPOSIO_WEBHOOK_SECRET;
     const raw = await c.req.text();
