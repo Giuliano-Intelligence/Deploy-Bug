@@ -1,5 +1,8 @@
 import { Hono } from "hono";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { signCommit, trailers } from "@deploybug/policy";
 import { ComposioConnectMcp } from "@deploybug/providers";
 import { ingestComment } from "./ingest.ts";
 import { analysePush, pushTicketText, type PushRequest } from "./push.ts";
@@ -38,16 +41,29 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     return result;
   }
 
-  async function runPush(p: { req: PushRequest; files: { path: string; content: string }[] }) {
-    const { req, files } = p;
+  function signingKey() {
+    if (process.env.DEPLOYBUG_SIGNING_KEY) return process.env.DEPLOYBUG_SIGNING_KEY;
+    const f = process.env.DEPLOYBUG_SIGNING_KEY_FILE ?? "/tmp/keys/deploybug_signing";
+    if (!existsSync(f)) { mkdirSync(dirname(f), { recursive: true }); writeFileSync(f, randomUUID() + randomUUID(), { mode: 0o600 }); }
+    return readFileSync(f, "utf8").trim();
+  }
+
+  async function runPush(p: { req: PushRequest; files: { path: string; content: string | null }[]; ticket: string }) {
+    const { req, files, ticket } = p;
     const user = req.user ?? process.env.OWNER_USER ?? "owner";
     const cred = await vault.get(user, "composio");
     let live = process.env.DRY_RUN !== "1" && !!cred?.apiKey?.startsWith("ck_");
     let mcp: ComposioConnectMcp | undefined;
     if (live) { mcp = new ComposioConnectMcp(cred!.apiKey); live = ((await mcp.listConnections(["github"])).github ?? 0) > 0; }
     const [owner, repo] = req.repo.split("/");
-    const calls = files.map(f => ({ tool: "GITHUB_CREATE_OR_UPDATE_FILE_CONTENTS", args: { owner, repo, path: f.path, branch: req.branch, message: req.message, content: Buffer.from(f.content).toString("base64") } }));
-    if (!live) return { dryRun: true, reason: process.env.DRY_RUN === "1" ? "DRY_RUN=1" : "no GitHub connection in Composio", commits: calls.map(c => ({ ...c, args: { ...c.args, content: `<${c.args.content.length} base64 chars>` } })) };
+    const key = signingKey();
+    const calls = files.map(f => {
+      const message = req.message + trailers(ticket, signCommit(key, ticket, req.repo, req.branch, [f]));
+      return f.content === null
+        ? { tool: "GITHUB_DELETE_A_FILE", args: { owner, repo, path: f.path, branch: req.branch, message } }
+        : { tool: "GITHUB_CREATE_OR_UPDATE_FILE_CONTENTS", args: { owner, repo, path: f.path, branch: req.branch, message, content: Buffer.from(f.content).toString("base64") } };
+    });
+    if (!live) return { dryRun: true, reason: process.env.DRY_RUN === "1" ? "DRY_RUN=1" : "no GitHub connection in Composio", commits: calls.map(c => ({ ...c, args: { ...c.args, ...("content" in c.args ? { content: `<${String(c.args.content).length} base64 chars>` } : {}) } })) };
     return queue.add(`github:push:${req.repo}`, async () => {
       const out = []; for (const c of calls) out.push(await mcp!.execute(c.tool, c.args, cred!.account)); return { dryRun: false, results: out };
     });
@@ -130,17 +146,18 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     const pol = (policy.policies as any).push;
     if (!pol) return c.json({ error: "push policy not configured" }, 500);
     const a = await analysePush(req, pol, checker, models.escalateBelow);
-    const summary = { verdict: a.verdict, reasons: a.reasons, files: a.files, score: a.score, scanModel: a.scanModel, secrets: a.secrets };
+    const summary = { verdict: a.verdict, reasons: a.reasons, files: a.files, gateChanges: a.gateChanges, score: a.score, scanModel: a.scanModel, secrets: a.secrets };
     if (a.verdict === "block") { log({ push: req.repo, branch: req.branch, ...summary }); return c.json(summary, 403); }
     if (a.verdict === "approve") {
-      const t: Ticket = { id: randomUUID().slice(0, 8), summary: "", createdAt: Date.now(), status: "pending", payload: { kind: "push", req: { ...req, files: undefined, diff: undefined }, files: a.sanitized } };
+      const t: Ticket = { id: randomUUID().slice(0, 8), summary: "", createdAt: Date.now(), status: "pending", payload: { kind: "push", req: { ...req, files: undefined, diff: undefined }, files: a.sanitized, ticket: "" } };
+      t.payload.ticket = t.id;
       t.summary = pushTicketText(t.id, req, a, formatTime(tzOf(req.user)));
       tickets.set(t.id, t);
       const sent = await notifier.sendApproval(t).catch(e => ({ error: String(e) }));
       log({ push: req.repo, branch: req.branch, ticket: t.id, ...summary });
       return c.json({ ...summary, verdict: "pending_approval", ticket: t.id, telegram: sent && !(sent as any).skipped, message: t.summary }, 202);
     }
-    const result = await runPush({ req, files: a.sanitized });
+    const result = await runPush({ req, files: a.sanitized, ticket: `auto-${randomUUID().slice(0, 8)}` });
     log({ push: req.repo, branch: req.branch, ...summary, result });
     return c.json({ ...summary, result });
   });

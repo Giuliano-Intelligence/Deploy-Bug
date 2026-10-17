@@ -62,3 +62,7 @@ push:
   stripConfigComments: false
   maxFiles: 50
   maxFileBytes: 200000
+  # The gate never writes code. These are the ONLY changes it may make to an agent's push; anything else is rejected.
+  gateActions: [delete_file, remove_dependency, strip_comments]
+  autoDeleteFiles: ["*.DS_Store", "*.pem", "*.key", "*/.env", ".env"]
+  removeDependencies: ["event-stream", "flatmap-stream"]

@@ -74,7 +74,21 @@ Add an app: add an entry under `apps:` in `config/policies.yaml` — a worker is
 3. **Policy** (`push:` in `config/policies.yaml`): allowed repos and branch globs, `protectedBranches` (main) always need approval, secret-pattern scan blocks leaked keys, size and path limits.
 4. **Approve** on Telegram when risky or protected; then the **github-worker** pushes via Composio Connect using the user's vaulted key. Without a live GitHub connection (or with `DRY_RUN=1`) it returns the exact commit plan instead.
 
-Backstop: `./scripts/strip-comments [--check] [--include-config] [--drop-license] <dir>` cleans an existing repo; `.github/workflows/no-comments.yml` fails CI if comments are present. Deploy Bug's own code is comment-free and passes this check.
+**The gate never writes code.** Its only allowed changes to an agent's push are an allowlist enforced by `GateActionGuard` in `packages/policy` (`gateActions:` in `policies.yaml`): **delete a file** (e.g. `*.pem`, `.env`), **remove a dependency** from `package.json` (e.g. a known-bad package), and **strip comments**. Each change is verified: a deletion must remove the file, a dependency removal must change nothing else, and comment stripping must be a pure deletion (the result is a subsequence of the original). Anything else, or any other action name, is rejected; diffs are refused because the gate would have to reconstruct code. Agent code otherwise passes through unchanged.
+
+Every commit the gate makes carries trailers:
+```
+Deploy-Bug-Approved: <ticket>
+Deploy-Bug-Signature: <HMAC-SHA256(DEPLOYBUG_SIGNING_KEY, ticket:repo:branch:digest-of-changed-files)>
+```
+
+### Lock the repo down
+1. **Disconnect direct GitHub write access** from every coding agent: Claude (mobile and web connectors) and Claude Code (`gh auth logout`, remove PATs and SSH keys), Cursor (Settings, GitHub integration), Codex, Copilot agents, Grok Bot and any GitHub App with write scope. Agents push only via `POST /push`.
+2. Add the repo secret **`DEPLOYBUG_SIGNING_KEY`** with the same value as the gate's `DEPLOYBUG_SIGNING_KEY` (or the file `/tmp/keys/deploybug_signing` on the gate box).
+3. Copy `.github/workflows/deploybug-guard.yml` and `.github/deploybug/verify-commits.mjs` into the repo. On every push and PR it fails if code comments are present, if the secret scan finds keys, or if any commit lacks a valid Deploy Bug signature. Without the secret it runs in bootstrap mode (warning only).
+4. **Branch protection** (Settings, Branches, rule for `main`): require a pull request, require status check **`deploybug-guard / guard`**, block force pushes, and include administrators.
+
+Backstop: `./scripts/strip-comments [--check] [--include-config] [--drop-license] <dir>` cleans an existing repo; `.github/workflows/deploybug-guard.yml` fails CI if comments are present. Deploy Bug's own code is comment-free and passes this check.
 
 ## Recommended companions
 Deploy Bug guards what agents **do at runtime**. Pair it with tools that guard the **code**; users set these up separately on their own accounts:

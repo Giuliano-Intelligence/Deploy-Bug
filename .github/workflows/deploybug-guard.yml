@@ -1,0 +1,25 @@
+name: deploybug-guard
+on:
+  push:
+  pull_request:
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm ci
+      - name: No code comments
+        run: ./scripts/strip-comments --check .
+      - name: Secret scan
+        run: npx tsx scripts/secret-scan.ts
+      - name: Commits came through Deploy Bug
+        env:
+          DEPLOYBUG_SIGNING_KEY: ${{ secrets.DEPLOYBUG_SIGNING_KEY }}
+          RANGE_FROM: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          RANGE_TO: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: node .github/deploybug/verify-commits.mjs
+      - run: npm run typecheck
+      - run: npm test
