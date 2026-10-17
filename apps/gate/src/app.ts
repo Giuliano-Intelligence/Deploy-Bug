@@ -195,7 +195,7 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
       sessions.set(sid, Date.now() + 12 * 3600_000);
       return c.body(null, 302, { location: "/", "set-cookie": `db_session=${sid}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=43200`, "cache-control": "no-store" });
     }
-    return c.html(DASHBOARD, 200, { "cache-control": "no-store", "content-security-policy": "default-src 'self'; script-src 'unsafe-inline' 'self'; style-src 'unsafe-inline'; img-src 'self'; connect-src 'self'; frame-ancestors 'none'" });
+    return c.html(DASHBOARD, 200, { "cache-control": "no-store", "content-security-policy": "default-src 'self'; script-src 'unsafe-inline' 'self'; style-src 'unsafe-inline' https://rsms.me; font-src https://rsms.me; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'" });
   });
   app.get("/manifest.webmanifest", c => c.body(MANIFEST, 200, { "content-type": "application/manifest+json" }));
   app.get("/icon.svg", c => c.body(ICON, 200, { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400" }));
@@ -205,6 +205,23 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
       connectors: CONNECTORS.map(k => ({ slug: k.slug, name: k.name, via: k.via })), connected: toolkitAgents.list().map(a => a.replace(/-agent$/, "")),
       tickets: [...tickets.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, 30).map(t => ({ id: t.id, status: t.status, summary: t.summary.slice(0, 200), createdAt: t.createdAt })),
       runs: store.pending().map((r: any) => ({ id: r.id, kind: r.kind, verdict: r.verdict })), audit: audit.slice(-30).reverse().map(a => ({ at: a.at, verdict: a.verdict, status: a.status, ticket: a.ticket })) });
+  });
+  const logos = new Map<string, { body: ArrayBuffer; type: string; at: number }>();
+  app.get("/logo/:slug", async c => {
+    const slug = c.req.param("slug");
+    if (!CONNECTORS.some(k => k.slug === slug)) return c.body(null, 404);
+    let hit = logos.get(slug);
+    if (!hit || Date.now() - hit.at > 86400_000) {
+      for (const u of [`https://logos.composio.dev/api/${slug}`, `https://cdn.simpleicons.org/${slug}/ffffff`]) {
+        try {
+          const r = await fetch(u, { signal: AbortSignal.timeout(4000) });
+          const type = r.headers.get("content-type") ?? "";
+          if (r.ok && /^image\//.test(type)) { hit = { body: await r.arrayBuffer(), type: type.split(";")[0], at: Date.now() }; logos.set(slug, hit); break; }
+        } catch {}
+      }
+    }
+    if (!hit) return c.body(ICON, 200, { "content-type": "image/svg+xml" });
+    return c.body(hit.body, 200, { "content-type": hit.type, "cache-control": "public, max-age=86400", "x-content-type-options": "nosniff", "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'" });
   });
   app.post("/ui/connect/:slug", async c => {
     if (!isOwner(c) && !sessionOk(c)) return c.json({ error: "unauthorized" }, 401);

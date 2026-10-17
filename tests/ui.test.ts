@@ -24,4 +24,6 @@ test("dashboard needs a one-time code, data stays private", async () => {
   assert.equal(gh.url, "https://connect.composio.dev/link/github");
   const ex: any = await (await g.app.request("/ui/connect/expo", { method: "POST", headers: { cookie } })).json();
   assert.equal(ex.setup.auth, "DCR_OAUTH");
+  assert.equal((await g.app.request("/logo/not-a-tool")).status, 404);
+  assert.match((await (await g.app.request("/")).text()), /class="tiles"/);
 });
