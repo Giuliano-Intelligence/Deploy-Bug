@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { signCommit, trailers } from "@deploybug/policy";
+import { stagedPush, composioStageOps, stageBranch, signedMessage } from "./stage.ts";
 import { ComposioConnectMcp } from "@deploybug/providers";
 import { ingestComment } from "./ingest.ts";
 import { analysePush, pushTicketText, type PushRequest } from "./push.ts";
@@ -56,18 +56,10 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     let live = process.env.DRY_RUN !== "1" && !!cred?.apiKey?.startsWith("ck_");
     let mcp: ComposioConnectMcp | undefined;
     if (live) { mcp = new ComposioConnectMcp(cred!.apiKey); live = ((await mcp.listConnections(["github"])).github ?? 0) > 0; }
-    const [owner, repo] = req.repo.split("/");
     const key = signingKey();
-    const calls = files.map(f => {
-      const message = req.message + trailers(ticket, signCommit(key, ticket, req.repo, req.branch, [f]));
-      return f.content === null
-        ? { tool: "GITHUB_DELETE_A_FILE", args: { owner, repo, path: f.path, branch: req.branch, message } }
-        : { tool: "GITHUB_CREATE_OR_UPDATE_FILE_CONTENTS", args: { owner, repo, path: f.path, branch: req.branch, message, content: Buffer.from(f.content).toString("base64") } };
-    });
-    if (!live) return { dryRun: true, reason: process.env.DRY_RUN === "1" ? "DRY_RUN=1" : "no GitHub connection in Composio", commits: calls.map(c => ({ ...c, args: { ...c.args, ...("content" in c.args ? { content: `<${String(c.args.content).length} base64 chars>` } : {}) } })) };
-    return queue.add(`github:push:${req.repo}`, async () => {
-      const out = []; for (const c of calls) out.push(await mcp!.execute(c.tool, c.args, cred!.account)); return { dryRun: false, results: out };
-    });
+    const message = (f: { path: string; content: string | null }[]) => signedMessage(key, ticket, req.repo, req.branch, req.message, f);
+    if (!live) return { dryRun: true, reason: process.env.DRY_RUN === "1" ? "DRY_RUN=1" : "no GitHub connection in Composio", stage: stageBranch(req.branch, ticket), commits: files.map(f => ({ tool: f.content === null ? "GITHUB_DELETE_A_FILE" : "GITHUB_CREATE_OR_UPDATE_FILE_CONTENTS", args: { path: f.path, branch: stageBranch(req.branch, ticket), message: message([f]) } })) };
+    return queue.add(`github:push:${req.repo}`, () => stagedPush(composioStageOps((t, a) => mcp!.execute(t, a, cred!.account), req.repo), { repo: req.repo, target: req.branch, ticket, message: req.message, files, key, perFile: true }));
   }
 
   async function decide(id: string, approve: boolean) {
