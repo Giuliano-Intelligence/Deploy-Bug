@@ -8,8 +8,8 @@ Agents like Grok Bot, Claude Code or a public X community agent never hold API k
 ## What it does
 - **Gate:** one entry point (`POST /requests`) for every agent. Nothing reaches GitHub, Stripe, Mux or X directly.
 - **Checker (read-only):** a cheap model scores injection risk from 0 to 100 (100 = safe). A score under 80 escalates to a stronger model via OpenRouter. It flags changes to brand colours, fonts, logo or UI tokens. It never calls a tool.
-- **Worker (reactive):** a `deepagents` agent (DeepSeek V4.1 Flash via RedPill) that only runs approved tasks. Its `execute` and file tools point at a CreateOS sandbox backend.
-- **Sandbox:** one fresh or forked sandbox per task. Egress is deny-by-default (only `github.com`, the package registry and the model API). It runs tests and serves a preview URL. It is paused or destroyed when the task is done.
+- **Workers (reactive):** a pool of fresh, single-step `deepagents` instances (DeepSeek V4.1 Flash via RedPill, GLM-5.3 via OpenRouter for the judge and investigator). Each step gets a new agent ID and no long-term memory. They only propose; the policy package decides.
+- **Where agents run:** inside the gate process on one CreateOS sandbox (the Free plan allows one sandbox). Sandbox-per-task is a config flag (`SANDBOX_PER_TASK`), off by default.
 - **Vault:** keys (GitHub, Stripe restricted key, Mux, X, Telegram) live only in Deploy Bug's server env or connector layer (Composio). Agents ask for actions, not keys.
 - **Approvals:** a Telegram bot (BotFather) with ✅ Approve / ❌ Reject buttons, plus a dashboard with the diff, the verdict, an audit log and an auto-ship toggle.
 - **Refund guard:** `refund(charge_id)` is allowed only if the amount is £20 or less, the customer has had no previous refund, and only one charge is named. Anything else is blocked and logged.
@@ -98,16 +98,17 @@ Deploy Bug guards what agents **do at runtime**. Pair it with tools that guard t
 ## Components
 | Folder | What it is |
 |---|---|
-| `gate/` | FastAPI or Node server: `/requests`, `/approve`, `/telegram/webhook`, dashboard API |
-| `checker/` | Prompts plus scoring: injection score, brand-diff check, refund rule |
-| `worker/` | deepagents worker with a CreateOS `SandboxBackendProtocol` adapter (`execute` → sandbox exec) |
-| `vault/` | Thin wrappers that hold keys: GitHub, Stripe (restricted key), Mux, X, Telegram |
-| `dashboard/` | Requests list, diff view, approve/reject, auto-ship toggle, audit log |
-| `bugfix-app/` | The tiny demo web app with one Mux-hosted anime video and `brand.json` |
+| `apps/gate/` | Hono (Node, TypeScript) gate: `/requests`, `/push`, `/rollback`, `/incident`, `/tickets/:id/approve`, `/media/current`, `/connect`, `/vpn` |
+| `packages/checker/` | Injection checker panel with escalation, fail-closed |
+| `packages/policy/` | Rules: refunds, allowed tools, gate actions (delete file, remove dependency, strip comments, restore), commit signing |
+| `packages/workers/` | Agent pool, 2+1+1 tribunal, auditor, durable run store |
+| `packages/providers/` | Composio, Mux and GitHub App clients |
+| `packages/notifier/`, `packages/summarizer/` | Telegram approvals and alerts |
+| `.github/deploybug/` | CI verifier for gate-signed commits |
 
 ## Tech stack
 - **Stripe Projects CLI:** provisions the stack and env (`stripe projects add ...`, for example Supabase for the audit log and OpenRouter), plus Stripe test mode for refunds.
-- **CreateOS:** hosts the gate, dashboard and Bug Fix app (deploy from GitHub). **CreateOS Sandbox** (`devbox:1`, `s-2vcpu-4gb`) runs the worker's code.
+- **CreateOS:** hosts the gate, dashboard and Bug Fix app (deploy from GitHub). **CreateOS Sandbox** (`s-1vcpu-1gb`) runs the gate and its agents.
 - **Agents:** `deepagents` (MIT), DeepSeek V4.1 Flash via RedPill, escalation model via OpenRouter.
 - **Connectors:** Composio (free Hobby plan) for GitHub, Gmail, X, Telegram, Supabase and Stripe, with custom tools for Mux.
 - **Notifications:** Telegram Bot API.
@@ -147,7 +148,7 @@ SUPABASE_URL=
 SUPABASE_SERVICE_KEY=
 X_API_KEY=                  # placeholder, depends on X API tier
 ```
-Run: `<placeholder: e.g. uvicorn gate.main:app --host 0.0.0.0 --port 8080>`, then deploy the repo from GitHub on CreateOS.
+Run: `GATE_OWNER_TOKEN=... GATE_AGENT_TOKEN=... npm start` (the gate refuses to start without two different tokens).
 
 ## Demo script (about 3 min)
 1. **Community request ships.** The X agent forwards "add a dark-mode toggle to Bug Fix". The checker scores 95. The worker forks a sandbox, edits the code and runs the tests (one fails, it fixes it and the rerun passes). The preview URL is shown. Auto-ship pushes to GitHub and CreateOS redeploys the live URL.

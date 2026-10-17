@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-process.env.DRY_RUN = "1"; process.env.VAULT_FILE = "/tmp/deploybug-media-vault.json"; process.env.CHECKER_OFFLINE = "1"; process.env.BUGFLIX_GATE_TOKEN = "bf-test";
+process.env.DRY_RUN = "1"; process.env.VAULT_FILE = "/tmp/deploybug-media-vault.json"; process.env.CHECKER_OFFLINE = "1"; process.env.BUGFLIX_GATE_TOKEN = "bf-test"; process.env.GATE_OWNER_TOKEN = "owner-token-0123456789abcdef"; process.env.GATE_AGENT_TOKEN = "agent-token-0123456789abcdef"; process.env.REFUND_HISTORY_FILE = `/tmp/db-refunds-${process.pid}-${Math.random()}.json`;
 const { MuxMedia } = await import("@deploybug/providers");
 const { buildGate } = await import("../apps/gate/src/app.ts");
 const { TelegramNotifier } = await import("@deploybug/notifier");

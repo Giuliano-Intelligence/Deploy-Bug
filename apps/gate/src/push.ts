@@ -2,10 +2,11 @@ import { stripComments, scanSecrets, type SecretHit } from "@deploybug/sanitize"
 import type { InjectionChecker } from "@deploybug/checker";
 import { GATE_ACTIONS, GateActionGuard, removeDependency, type GateChange } from "@deploybug/policy";
 
-export interface PushPolicy { repos: string[]; branches: string[]; protectedBranches: string[]; alwaysRequireApproval?: boolean; keepLicenseHeaders?: boolean; stripConfigComments?: boolean; maxFiles?: number; maxFileBytes?: number; gateActions?: string[]; autoDeleteFiles?: string[]; removeDependencies?: string[] }
+export interface PushPolicy { repos: string[]; branches: string[]; protectedBranches: string[]; alwaysRequireApproval?: boolean; keepLicenseHeaders?: boolean; stripConfigComments?: boolean; maxFiles?: number; maxFileBytes?: number; gateActions?: string[]; autoDeleteFiles?: string[]; removeDependencies?: string[]; injectionExemptPaths?: string[] }
 export interface PushFile { path: string; content: string | null }
 export interface PushRequest { agent?: string; user?: string; repo: string; branch: string; message: string; files?: PushFile[]; diff?: string }
 
+export const SENSITIVE = [".github/*", ".circleci/*", ".gitlab-ci.yml", ".coderabbit.yaml", "scripts/*", "Dockerfile", "*/Dockerfile", ".husky/*", ".npmrc"];
 const glob = (pat: string, s: string) => new RegExp("^" + pat.split("*").map(x => x.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$").test(s);
 
 export interface PushAnalysis {
@@ -58,7 +59,11 @@ export async function analysePush(req: PushRequest, pol: PushPolicy, checker: In
   const secrets = input.flatMap(f => f.content === null ? [] : scanSecrets(f.path, f.content)).concat(scanSecrets("commit message", req.message ?? ""));
   if (secrets.length) block(`Possible secrets found: ${[...new Set(secrets.map(s => `${s.kind} in ${s.path}:${s.line}`))].slice(0, 5).join(", ")}`);
 
-  const corpus = [`COMMIT MESSAGE: ${req.message}`, ...sanitized.filter(f => f.content !== null).map(f => `FILE ${f.path}:\n${f.content}`)].join("\n\n").slice(0, 24_000);
+  const isOwner = req.agent === "owner";
+  const sensitive = input.filter(f => SENSITIVE.some(g => glob(g, f.path)) || (/(^|\/)package\.json$/.test(f.path) && f.content !== null && /"scripts"\s*:/.test(f.content)));
+  if (sensitive.length && !isOwner) needApproval(`Touches CI, workflows or package scripts (${sensitive.map(f => f.path).slice(0, 4).join(", ")}), so only the owner can sign this off`);
+  const exempt = isOwner ? (pol.injectionExemptPaths ?? []) : [];
+  const corpus = [`COMMIT MESSAGE: ${req.message}`, ...sanitized.filter(f => f.content !== null && !exempt.some(g => glob(g, f.path))).map(f => `FILE ${f.path}:\n${f.content}`)].join("\n\n").slice(0, 24_000);
   const check = await checker.check(corpus);
   if (check.score < threshold) block(`The code or text looks like a prompt-injection attempt (safety ${check.score}/100)`);
 

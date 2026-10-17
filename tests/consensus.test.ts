@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert";
 import { generateKeyPairSync, createVerify } from "node:crypto";
-process.env.DRY_RUN = "1"; process.env.VAULT_FILE = "/tmp/deploybug-cons-vault.json"; process.env.CHECKER_OFFLINE = "1"; process.env.GATE_AGENT_TOKEN = "gt";
+process.env.DRY_RUN = "1"; process.env.VAULT_FILE = "/tmp/deploybug-cons-vault.json"; process.env.CHECKER_OFFLINE = "1"; process.env.GATE_OWNER_TOKEN = "owner-token-0123456789abcdef"; process.env.GATE_AGENT_TOKEN = "agent-token-0123456789abcdef"; process.env.REFUND_HISTORY_FILE = `/tmp/db-refunds-${process.pid}-${Math.random()}.json`;
 const { consensus, ToolkitAgents } = await import("@deploybug/workers");
 const { appJwt } = await import("@deploybug/providers");
 const { appStageOps, stagedPush } = await import("../apps/gate/src/stage.ts");
@@ -37,7 +37,8 @@ test("voters run with separate inputs only", async () => {
 
 const blockAll = async () => JSON.stringify({ verdict: "block", reasoning: "same", ok: true });
 const g = buildGate({ notifier: new TelegramNotifier(undefined), runner: blockAll, store: new (await import("@deploybug/workers")).ResultStore(`/tmp/db-runs-${process.pid}`), connect: async tk => Object.fromEntries(tk.map(t => [t, { status: "initiated", redirect_url: `https://connect.composio.dev/link/lk_${t}` }])) });
-const auth = { authorization: "Bearer gt", "content-type": "application/json" };
+const auth = { authorization: "Bearer agent-token-0123456789abcdef", "content-type": "application/json" };
+const own = { authorization: "Bearer owner-token-0123456789abcdef", "content-type": "application/json" };
 
 test("refund requests go through the consensus panel and policy still applies", async () => {
   const r = await g.app.request("/requests", { method: "POST", headers: auth, body: JSON.stringify({ app: "stripe", tool: "STRIPE_CREATE_REFUND", text: "Refund order 7", args: { charge: "ch_7", customer: "cus_7", amount: 500, currency: "gbp" } }) });
@@ -45,17 +46,20 @@ test("refund requests go through the consensus panel and policy still applies", 
   assert.match((await r.json() as any).reason, /independent checkers/);
 });
 test("one-tap connect returns a Composio link per picked toolkit", async () => {
-  const r = await g.app.request("/connect?t=gt&toolkits=github,stripe", { headers: { accept: "application/json" } });
+  const code = (await (await g.app.request("/connect/code", { method: "POST", headers: own })).json() as any).code;
+  assert.equal((await g.app.request("/connect/code", { method: "POST", headers: auth })).status, 401);
+  const r = await g.app.request(`/connect?c=${code}&toolkits=github,stripe`, { headers: { accept: "application/json" } });
+  assert.equal((await g.app.request(`/connect?c=${code}&toolkits=github`)).status, 401);
   assert.deepEqual((await r.json() as any).links.map((l: any) => l.toolkit), ["github", "stripe"]);
   assert.equal((await g.app.request("/connect?toolkits=github")).status, 401);
-  assert.match(await (await g.app.request("/connect?t=gt")).text(), /checkbox/);
+  assert.match(await (await g.app.request("/connect", { headers: own })).text(), /checkbox/);
 });
 test("each connected toolkit gets its own agent and events route to it", async () => {
-  const s = await g.app.request("/connect/sync", { method: "POST", headers: auth, body: JSON.stringify({ sentry: 1, stripe: 1, slack: 0 }) });
+  const s = await g.app.request("/connect/sync", { method: "POST", headers: own, body: JSON.stringify({ sentry: 1, stripe: 1, slack: 0 }) });
   assert.deepEqual((await s.json() as any).agents, ["sentry-agent", "stripe-agent"]);
-  const e = await g.app.request("/composio/events", { method: "POST", headers: auth, body: JSON.stringify({ type: "SENTRY_NEW_ISSUE", data: { title: "TypeError in player" } }) });
+  const e = await g.app.request("/composio/events", { method: "POST", headers: own, body: JSON.stringify({ type: "SENTRY_NEW_ISSUE", data: { title: "TypeError in player" } }) });
   assert.equal((await e.json() as any).agent, "sentry-agent");
-  const u = await g.app.request("/composio/events", { method: "POST", headers: auth, body: JSON.stringify({ type: "NOTION_PAGE" }) });
+  const u = await g.app.request("/composio/events", { method: "POST", headers: own, body: JSON.stringify({ type: "NOTION_PAGE" }) });
   assert.equal((await u.json() as any).routed, false);
 });
 test("toolkit agents are created lazily, none when nothing is connected", () => assert.deepEqual(new ToolkitAgents(() => undefined).list(), []));
@@ -75,7 +79,7 @@ test("app stage ops make one signed commit and never force", async () => {
     if (path.startsWith("/git/commits/")) return { tree: { sha: "t0" } };
     if (path === "/git/trees") return { sha: "t1" };
     if (path === "/git/commits") return { sha: "c1" };
-    if (path.startsWith("/actions/runs")) return { workflow_runs: [{ name: "deploybug-guard", status: "completed", conclusion: "success" }] };
+    if (path.startsWith("/actions/runs")) return { workflow_runs: [{ name: "deploybug-guard", path: ".github/workflows/deploybug-guard.yml", status: "completed", conclusion: "success" }] };
     return {};
   };
   const r = await stagedPush(appStageOps(api), { repo: "o/r", target: "main", ticket: "t9", message: "m", key: "k", files: [{ path: "a.ts", content: "x" }, { path: "b.ts", content: null }] }, { tries: 2, ms: 1 });

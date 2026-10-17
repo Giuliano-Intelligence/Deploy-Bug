@@ -52,9 +52,19 @@ export class TelegramNotifier {
         for (const u of j.result ?? []) {
           offset = u.update_id + 1;
           const d: string | undefined = u.callback_query?.data;
+          const fromOk = ownerCallback(u.callback_query, this.chatId);
+          if (d && !fromOk) { await this.answer(u.callback_query.id, "Only the owner can decide").catch(() => {}); continue; }
           if (d) { const [act, id] = d.split(":"); await onDecision(id, act === "approve", u.callback_query.id); }
         }
       } catch { await new Promise(r => setTimeout(r, 3000)); }
     }
   }
+}
+
+export function ownerCallback(cq: any, chatId?: string | number) {
+  const owner = process.env.TELEGRAM_OWNER_ID;
+  const chat = String(cq?.message?.chat?.id ?? "");
+  const from = String(cq?.from?.id ?? "");
+  if (!chatId || chat !== String(chatId)) return false;
+  return owner ? from === owner : chat === from;
 }

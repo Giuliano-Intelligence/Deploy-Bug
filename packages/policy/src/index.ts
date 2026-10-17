@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { parse } from "yaml";
 
 export type Access = "read" | "write" | "both";
@@ -25,8 +26,15 @@ export function loadPolicies(path = "config/policies.yaml"): PolicyFile {
 const BULK = /\b(all|every(one|body)?|each|bulk|mass)\b/i;
 
 export class PolicyEngine {
-  private refunded = new Set<string>();
-  constructor(public policies: PolicyFile) {}
+  private refunded: Set<string>;
+  private historyFile: string;
+  constructor(public policies: PolicyFile, historyFile = process.env.REFUND_HISTORY_FILE ?? "data/refunds.json") {
+    this.historyFile = historyFile;
+    let list: string[] = [];
+    try { list = JSON.parse(readFileSync(historyFile, "utf8")).customers ?? []; } catch {}
+    this.refunded = new Set(list);
+  }
+  private persist() { mkdirSync(dirname(this.historyFile), { recursive: true }); writeFileSync(this.historyFile, JSON.stringify({ customers: [...this.refunded] })); }
 
   app(name: string) { return this.policies.apps[name]; }
 
@@ -62,7 +70,7 @@ export class PolicyEngine {
 
   recordExecuted(req: ActionRequest) {
     const r = this.app(req.app)?.rules?.refund;
-    if (r && r.tool === req.tool && (req.args as any).customer) this.refunded.add((req.args as any).customer);
+    if (r && r.tool === req.tool && (req.args as any).customer) { this.refunded.add((req.args as any).customer); this.persist(); }
   }
 }
 export * from "./gate-actions.ts";

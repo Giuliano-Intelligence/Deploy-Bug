@@ -5,6 +5,7 @@ import { dirname } from "node:path";
 import { runRollback, appRollbackSource, type RollbackSource } from "./rollback.ts";
 import { execFile } from "node:child_process";
 import { VpnMode } from "./vpn.ts";
+import { gateTokens, principal, isOwner, isAgentOrOwner, OneTimeCodes, safeEq } from "./auth.ts";
 import { stagedPush, composioStageOps, appStageOps, type StageOps, stageBranch, signedMessage } from "./stage.ts";
 import { ComposioConnectMcp, MuxMedia, GitHubAppClient, appConfig } from "@deploybug/providers";
 import { cors } from "hono/cors";
@@ -21,8 +22,10 @@ import { factsFromRequest, summarizeTicket, templateAlert, formatTime } from "@d
 import { createQueue } from "@deploybug/queue";
 import { TelegramNotifier, type Ticket } from "@deploybug/notifier";
 
-export function buildGate(opts: { notifier?: TelegramNotifier; vault?: CredentialStore; media?: MuxMedia; runner?: StepRunner; store?: ResultStore; connect?: (toolkits: string[]) => Promise<Record<string, any>>; rollback?: { source: RollbackSource; ops: StageOps; wait?: { tries: number; ms: number } }; redeploy?: (repo: string) => Promise<unknown>; vpn?: VpnMode } = {}) {
+export function buildGate(opts: { notifier?: TelegramNotifier; vault?: CredentialStore; media?: MuxMedia; runner?: StepRunner; store?: ResultStore; connect?: (toolkits: string[]) => Promise<Record<string, any>>; rollback?: { source: RollbackSource; ops: StageOps; wait?: { tries: number; ms: number } }; redeploy?: (repo: string) => Promise<unknown>; vpn?: VpnMode; chargeLookup?: (charge: string, user?: string) => Promise<string | undefined> } = {}) {
   const vpn = opts.vpn ?? new VpnMode();
+  gateTokens();
+  const codes = new OneTimeCodes();
   const media = opts.media ?? new MuxMedia();
   const vault = opts.vault ?? new FileVault();
   const profiles = new ProfileStore();
@@ -144,20 +147,29 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     return r?.data?.results ?? {};
   });
 
+  const chargeOwner = opts.chargeLookup ?? (async (charge: string, user?: string) => {
+    const key = (await vault.get(user ?? process.env.OWNER_USER ?? "owner", "stripe"))?.apiKey ?? process.env.STRIPE_SECRET_KEY;
+    if (!key || !/^ch_[A-Za-z0-9]+$|^py_[A-Za-z0-9]+$/.test(charge)) return undefined;
+    const r = await fetch(`https://api.stripe.com/v1/charges/${charge}`, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return undefined;
+    const j: any = await r.json();
+    return typeof j.customer === "string" ? j.customer : j.customer?.id;
+  });
   const app = new Hono();
   app.use("*", async (c, next) => { if (c.req.path === "/health" || vpn.allows(c)) return next(); return c.json({ error: "this gate only answers over its WireGuard VPN" }, 403); });
-  const token = process.env.GATE_AGENT_TOKEN;
-  app.use("/requests/*", async (c, next) => { if (token && c.req.header("authorization") !== `Bearer ${token}`) return c.json({ error: "unauthorized" }, 401); await next(); });
-  app.use("/requests", async (c, next) => { if (token && c.req.header("authorization") !== `Bearer ${token}`) return c.json({ error: "unauthorized" }, 401); await next(); });
+  const agentOnly = async (c: any, next: any) => { if (!isAgentOrOwner(c)) return c.json({ error: "unauthorized" }, 401); await next(); };
+  const owner = async (c: any, next: any) => { if (!isOwner(c)) return c.json({ error: "unauthorized" }, 401); await next(); };
+  app.use("/requests/*", agentOnly); app.use("/requests", agentOnly);
 
   app.get("/", c => c.json({ name: "deploybug-gate", workers: workers.list(), telegram: notifier.enabled, queue: queue.status(), models: { brain: models.brain.model, panel: models.panel.map(m => m.id ?? m.model), escalation: models.escalation?.model } }));
   app.get("/health", c => c.json({ ok: true }));
-  const ownerOk = (c: any) => { const t = process.env.GATE_OWNER_TOKEN ?? token; return !!t && (c.req.header("authorization") === `Bearer ${t}` || c.req.query("t") === t); };
+  const ownerOk = (c: any) => isOwner(c);
+  app.post("/connect/code", c => ownerOk(c) ? c.json({ code: codes.issue(), expiresInSec: 600, url: `/connect?c=CODE` }) : c.json({ error: "unauthorized" }, 401));
   app.get("/connect", async c => {
-    if (!ownerOk(c)) return c.text("unauthorized", 401);
+    if (!ownerOk(c) && !codes.consume(c.req.query("c"))) return c.text("unauthorized", 401);
     const picked = (c.req.query("toolkits") ?? "").split(",").map(x => x.trim().toLowerCase()).filter(x => /^[a-z0-9_]+$/.test(x));
     const esc = (x: string) => x.replace(/[&<>"']/g, ch => `&#${ch.charCodeAt(0)};`);
-    if (!picked.length) return c.html(`<!doctype html><meta name=viewport content="width=device-width"><title>Connect</title><h2>Connect your tools</h2><form method=get><input type=hidden name=t value="${esc(c.req.query("t") ?? "")}">${KNOWN_TOOLKITS.map(k => `<label style="display:block;font-size:1.3em;margin:.5em 0"><input type=checkbox name=tk value=${k}> ${k}</label>`).join("")}<button style="font-size:1.3em">Get links</button></form><script>document.forms[0].onsubmit=e=>{e.preventDefault();const f=new FormData(e.target);location.search="?t="+encodeURIComponent(f.get("t"))+"&toolkits="+f.getAll("tk").join(",")}</script>`);
+    if (!picked.length) return c.html(`<!doctype html><meta name=viewport content="width=device-width"><title>Connect</title><h2>Connect your tools</h2><form method=get><input type=hidden name=c value="${codes.issue()}">${KNOWN_TOOLKITS.map(k => `<label style="display:block;font-size:1.3em;margin:.5em 0"><input type=checkbox name=tk value=${k}> ${k}</label>`).join("")}<button style="font-size:1.3em">Get links</button></form><script>document.forms[0].onsubmit=e=>{e.preventDefault();const f=new FormData(e.target);location.search="?c="+encodeURIComponent(f.get("c"))+"&toolkits="+f.getAll("tk").join(",")}</script>`);
     try {
       const res = await connectFn(picked);
       const links = Object.entries(res).map(([k, v]: any) => ({ toolkit: k, status: v.status, url: v.redirect_url }));
@@ -176,7 +188,7 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
   });
   app.get("/connect/agents", c => ownerOk(c) ? c.json({ agents: toolkitAgents.list() }) : c.json({ error: "unauthorized" }, 401));
   app.post("/rollback", async c => {
-    if (!ownerOk(c) && !(token && c.req.header("authorization") === `Bearer ${token}`)) return c.json({ error: "unauthorized" }, 401);
+    if (!isAgentOrOwner(c)) return c.json({ error: "unauthorized" }, 401);
     const b = await c.req.json<{ repo: string; branch?: string; to?: string; reason?: string }>();
     const pol = (policy.policies as any).push;
     const branch = b.branch ?? "main";
@@ -214,11 +226,16 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     return c.json(p, 200, { "cache-control": "no-store" });
   });
   app.post("/incident", async c => {
-    if (!ownerOk(c) && !(token && c.req.header("authorization") === `Bearer ${token}`)) return c.json({ error: "unauthorized" }, 401);
-    const b = await c.req.json<{ repo: string; branch?: string; evidence: string }>();
+    const incidentSecret = process.env.INCIDENT_WEBHOOK_SECRET;
+    const raw = await c.req.text();
+    const signedSource = !!incidentSecret && safeEq((c.req.header("x-deploybug-signature") ?? "").replace(/^sha256=/, ""), createHmac("sha256", incidentSecret).update(raw).digest("hex"));
+    if (!ownerOk(c) && !signedSource) return c.json({ error: "owner token or signed source required" }, 401);
+    let b: { repo: string; branch?: string; evidence: string };
+    try { b = JSON.parse(raw); } catch { return c.json({ error: "bad json" }, 400); }
     const check = await checker.check(String(b.evidence ?? "").slice(0, 16000));
     const t = await critical("injection", String(b.evidence ?? ""));
-    const hacked = t ? t.verdict === "block" : check.score < models.escalateBelow;
+    const hacked = !!t && t.verdict === "block" && (t.path !== "exhausted");
+    if (!t && check.score < models.escalateBelow) { await notifier.sendAlert(templateAlert("incident", new Error(`Possible hack on ${b.repo}, but the checker tribunal is unavailable, so no automatic rollback. Use /rollback.`), undefined, tzOf())).catch(() => {}); return c.json({ hacked: "unconfirmed", score: check.score, rolledBack: false }); }
     if (!hacked) return c.json({ hacked: false, score: check.score, tribunal: t && { run: t.runId, path: t.path } });
     return c.json({ hacked: true, score: check.score, tribunal: t && { run: t.runId, path: t.path }, ...(await autoRollback(b.repo, b.branch ?? "main", String(b.evidence))) });
   });
@@ -237,34 +254,41 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
       log({ composioEvent: "blocked", score: check.score });
       const repo = ev?.repository?.full_name ?? ev?.data?.repository?.full_name;
       const ref = String(ev?.ref ?? ev?.data?.ref ?? "");
-      const live = repo && /^refs\/heads\//.test(ref) ? await autoRollback(repo, ref.replace("refs/heads/", ""), raw.slice(0, 400)) : undefined;
+      const t = secret ? await critical("injection", raw.slice(0, 16000)) : undefined;
+      const live = secret && t && t.verdict === "block" && t.path !== "exhausted" && repo && /^refs\/heads\//.test(ref) ? await autoRollback(repo, ref.replace("refs/heads/", ""), raw.slice(0, 400)) : undefined;
       return c.json({ routed: false, reason: "event looks like a prompt-injection attempt", rollback: live }, 403);
     }
     return c.json(await toolkitAgents.handle(ev));
   });
   app.use("/media/*", cors({ origin: "*", allowMethods: ["GET", "OPTIONS"], allowHeaders: ["Authorization"] }));
   app.get("/media/current", async c => {
-    const t = process.env.BUGFLIX_GATE_TOKEN ?? token;
-    if (!t || c.req.header("authorization") !== `Bearer ${t}`) return c.json({ error: "unauthorized" }, 401);
+    if (!principal(c)) return c.json({ error: "unauthorized" }, 401);
     try {
       const m = await media.current();
       if (!m) return c.json({ playbackId: null }, 404);
       return c.json({ playbackId: m.playbackId, title: m.title ?? null, description: m.description ?? null });
     } catch (e) { return c.json({ error: "media unavailable" }, 502); }
   });
-  app.get("/workers", c => c.json(workers.list()));
-  const owner = async (c: any, next: any) => { const t = process.env.GATE_OWNER_TOKEN ?? token; if (t && c.req.header("authorization") !== `Bearer ${t}`) return c.json({ error: "unauthorized" }, 401); await next(); };
+  app.get("/workers", c => isAgentOrOwner(c) ? c.json(workers.list()) : c.json({ error: "unauthorized" }, 401));
   app.use("/audit", owner); app.use("/tickets", owner);
   app.get("/audit", c => c.json(audit.slice(-100)));
   app.get("/tickets", c => c.json([...tickets.values()]));
 
   app.post("/requests", async c => {
     const req = (await c.req.json()) as ActionRequest;
+    const who = principal(c)!; req.user = who.user; req.agent = `${who.role}:${req.agent ?? "agent"}`.slice(0, 80);
     const text = [req.text ?? "", JSON.stringify(req.args ?? {})].join("\n");
     const check = await checker.check(text);
     if (check.score < models.escalateBelow) {
       log({ req, verdict: "block", check });
       return c.json({ verdict: "block", reason: "This looks like a prompt-injection attempt, so it was blocked", check }, 403);
+    }
+    const refundRule = policy.app(req.app)?.rules?.refund;
+    if (refundRule && refundRule.tool === req.tool) {
+      const charge = String((req.args as any)?.charge ?? (req.args as any)?.charge_id ?? "");
+      const owner = charge ? await chargeOwner(charge, req.user).catch(() => undefined) : undefined;
+      if (owner) (req.args as any).customer = owner;
+      else if (process.env.DRY_RUN !== "1") { log({ req, verdict: "block", reason: "charge lookup failed" }); return c.json({ verdict: "block", reason: "The customer couldn't be confirmed from the charge with Stripe, so the refund was blocked" }, 403); }
     }
     const d = policy.evaluate(req);
     if (d.verdict === "block") { log({ req, ...d, check }); return c.json({ ...d, check }, 403); }
@@ -301,9 +325,10 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
   app.get("/users/:user/credentials", async c => c.json({ providers: await vault.list(c.req.param("user")) }));
   app.delete("/users/:user/credentials/:provider", async c => { await vault.remove(c.req.param("user"), c.req.param("provider")); return c.json({ removed: true }); });
 
-  app.use("/push", async (c, next) => { if (token && c.req.header("authorization") !== `Bearer ${token}`) return c.json({ error: "unauthorized" }, 401); await next(); });
+  app.use("/push", agentOnly);
   app.post("/push", async c => {
     const req = await c.req.json<PushRequest>();
+    const who = principal(c)!; req.user = who.user; req.agent = who.role === "owner" ? "owner" : `agent:${String(req.agent ?? "agent").slice(0, 60)}`;
     const pol = (policy.policies as any).push;
     if (!pol) return c.json({ error: "push policy not configured" }, 500);
     const rp = resolveProvider(models, models.brain.provider);
@@ -347,8 +372,8 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
       if (sig.length !== want.length || !timingSafeEqual(Buffer.from(sig), Buffer.from(want))) return c.json({ error: "bad signature" }, 401);
       signed = true;
     } else {
-      if (token && c.req.header("authorization") !== `Bearer ${token}`) return c.json({ error: "unauthorized" }, 401);
-      signed = process.env.INGEST_TRUST_UNSIGNED === "1";
+      if (!isAgentOrOwner(c)) return c.json({ error: "unauthorized" }, 401);
+      signed = false;
     }
     const rec: any = await ingestComment({ ev: JSON.parse(raw), signed, sources: (policy.policies as any).sources ?? {}, checker, threshold: models.escalateBelow });
     if (!rec) return c.json({ ignored: true });
@@ -366,6 +391,7 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
     return c.json(rec);
   });
   app.get("/deploy/status", c => {
+    if (!principal(c)) return c.json({ error: "unauthorized" }, 401);
     const repo = c.req.query("repo"), pr = c.req.query("pr");
     const open = [...findings.values()].filter(f => f.status === "open" && f.blocksDeploy && (!repo || f.repo === repo) && (!pr || String(f.pr) === pr));
     return c.json({ deploy: open.length ? "blocked" : "ok", blockingFindings: open.map(f => ({ id: f.id, severity: f.severity, pr: f.pr, url: f.url })) });
@@ -376,7 +402,7 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
   app.get("/ingest/log", c => c.json(ingested.slice(-50)));
 
   app.post("/tickets/:id/:action{approve|deny}", async c => {
-    if (token && c.req.header("authorization") !== `Bearer ${process.env.GATE_OWNER_TOKEN ?? token}`) return c.json({ error: "unauthorized" }, 401);
+    if (!isOwner(c)) return c.json({ error: "unauthorized" }, 401);
     return c.json(await decide(c.req.param("id"), c.req.param("action") === "approve"));
   });
 

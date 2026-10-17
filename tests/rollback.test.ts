@@ -1,22 +1,27 @@
 import { test } from "node:test";
 import assert from "node:assert";
-process.env.DRY_RUN = "1"; process.env.VAULT_FILE = "/tmp/deploybug-rb-vault.json"; process.env.CHECKER_OFFLINE = "1"; process.env.GATE_AGENT_TOKEN = "gt";
+process.env.DRY_RUN = "1"; process.env.DEPLOYBUG_SIGNING_KEY = "k"; process.env.VAULT_FILE = "/tmp/deploybug-rb-vault.json"; process.env.CHECKER_OFFLINE = "1"; process.env.GATE_OWNER_TOKEN = "owner-token-0123456789abcdef"; process.env.GATE_AGENT_TOKEN = "agent-token-0123456789abcdef"; process.env.REFUND_HISTORY_FILE = `/tmp/db-refunds-${process.pid}-${Math.random()}.json`;
 const { planRollback, runRollback } = await import("../apps/gate/src/rollback.ts");
-const { GateActionGuard } = await import("@deploybug/policy");
+const { GateActionGuard, signCommit } = await import("@deploybug/policy");
+const { hmacVerifier } = await import("../apps/gate/src/rollback.ts");
 const { buildGate } = await import("../apps/gate/src/app.ts");
 const { TelegramNotifier } = await import("@deploybug/notifier");
 
-const sig = "\n\nDeploy-Bug-Approved: t1\nDeploy-Bug-Signature: " + "a".repeat(64);
 const tree: Record<string, Record<string, string | null>> = {
   c3: { "a.ts": "bad", "new.ts": "added" },
   c2: { "a.ts": "good", "new.ts": null },
+  c1: { "a.ts": "first", "new.ts": null },
 };
-const src = (green = new Set(["c2"])) => ({
-  async commits() { return [{ sha: "c3", message: "Bad" + sig }, { sha: "c2", message: "Good" + sig }, { sha: "c1", message: "unsigned" }]; },
+const own: Record<string, { path: string; content: string | null }[]> = { c3: [{ path: "a.ts", content: "bad" }, { path: "new.ts", content: "added" }], c2: [{ path: "a.ts", content: "good" }], c1: [{ path: "a.ts", content: "first" }] };
+const signed = (sha: string, repo: string, key = "k") => `m\n\nDeploy-Bug-Approved: t-${sha}\nDeploy-Bug-Signature: ${signCommit(key, `t-${sha}`, repo, "main", own[sha])}`;
+const src = (green = new Set(["c2", "c1"]), repo = "o/r", forged = false) => ({
+  async commits() { return [{ sha: "c3", message: signed("c3", repo) }, { sha: "c2", message: forged ? signed("c2", repo, "attacker") : signed("c2", repo) }, { sha: "c1", message: "unsigned" }]; },
   async guardGreen(s: string) { return green.has(s); },
   async changedPaths() { return ["a.ts", "new.ts"]; },
   async fileAt(s: string, p: string) { return tree[s]?.[p] ?? null; },
+  async commitFiles(s: string) { return own[s]; },
 });
+const V = (x: any, repo = "o/r") => hmacVerifier(x, "k", repo, "main");
 function ops() {
   const log: string[] = []; let files: any[] = []; let message = "";
   return { log, get files() { return files; }, get message() { return message; }, o: {
@@ -28,14 +33,16 @@ function ops() {
 }
 
 test("rollback restores the last signed green commit's files", async () => {
-  const p = await planRollback(src(), "main");
+  const x = src(); const p = await planRollback(x, "main", undefined, V(x));
   assert.equal(p.good, "c2");
   assert.deepEqual(p.files, [{ path: "a.ts", content: "good" }, { path: "new.ts", content: null }]);
   assert.ok(p.changes.every(c => c.op === "restore"));
 });
 test("unsigned or red commits are never rollback targets", async () => {
-  await assert.rejects(() => planRollback(src(new Set()), "main"), /no earlier gate-signed/);
-  await assert.rejects(() => planRollback(src(), "main", "c1"), /not a gate-signed/);
+  const a = src(new Set()), b = src(), f = src(undefined, "o/r", true);
+  await assert.rejects(() => planRollback(a, "main", undefined, V(a)), /no earlier gate-signed/);
+  await assert.rejects(() => planRollback(b, "main", "c1", V(b)), /not a gate-signed/);
+  await assert.rejects(() => planRollback(f, "main", undefined, V(f)), /no earlier gate-signed/);
 });
 test("restore guard rejects anything that is not the prior signed content", () => {
   const g = new GateActionGuard();
@@ -53,8 +60,8 @@ test("rollback goes through the staged signed flow, never force, then redeploys"
 });
 test("rollback endpoint needs owner approval before anything runs", async () => {
   const k = ops(); let deployed = 0;
-  const g = buildGate({ notifier: new TelegramNotifier(undefined), rollback: { source: src(), ops: k.o, wait: { tries: 2, ms: 1 } }, redeploy: async () => { deployed++; return {}; } });
-  const h = { authorization: "Bearer gt", "content-type": "application/json" };
+  const g = buildGate({ notifier: new TelegramNotifier(undefined), rollback: { source: src(undefined, "Giuliano-Intelligence/Deploy-Bug"), ops: k.o, wait: { tries: 2, ms: 1 } }, redeploy: async () => { deployed++; return {}; } });
+  const h = { authorization: "Bearer agent-token-0123456789abcdef", "content-type": "application/json" };
   const r = await g.app.request("/rollback", { method: "POST", headers: h, body: JSON.stringify({ repo: "Giuliano-Intelligence/Deploy-Bug", reason: "player broke" }) });
   assert.equal(r.status, 202);
   const j: any = await r.json();

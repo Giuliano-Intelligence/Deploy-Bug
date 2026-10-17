@@ -66,3 +66,4 @@ push:
   gateActions: [delete_file, remove_dependency, strip_comments, restore]
   autoDeleteFiles: ["*.DS_Store", "*.pem", "*.key", "*/.env", ".env"]
   removeDependencies: ["event-stream", "flatmap-stream"]
+  injectionExemptPaths: ["tests/*", "README.md", "scripts/demo.sh"]

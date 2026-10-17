@@ -8,6 +8,10 @@ const ref = process.env.GITHUB_BASE_REF || process.env.GITHUB_REF_NAME || "";
 const branch = ref.match(/^deploybug\/stage\/(.+)\/[^/]+$/)?.[1] ?? ref;
 const [from, to] = [process.env.RANGE_FROM ?? "", process.env.RANGE_TO ?? "HEAD"];
 
+if (!key && process.env.GITHUB_EVENT_NAME === "pull_request") {
+  console.log("::error::DEPLOYBUG_SIGNING_KEY is not available to this pull_request run, so commits cannot be verified");
+  process.exit(1);
+}
 if (!key) {
   console.log("::warning::DEPLOYBUG_SIGNING_KEY is not set, so commit signatures are not enforced (bootstrap mode). Add the repo secret to enforce.");
   process.exit(0);

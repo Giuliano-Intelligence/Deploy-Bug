@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-process.env.DRY_RUN = "1"; process.env.VAULT_FILE = "/tmp/deploybug-tri-vault.json"; process.env.CHECKER_OFFLINE = "1"; process.env.GATE_AGENT_TOKEN = "gt";
+process.env.DRY_RUN = "1"; process.env.DEPLOYBUG_SIGNING_KEY = "k"; process.env.VAULT_FILE = "/tmp/deploybug-tri-vault.json"; process.env.CHECKER_OFFLINE = "1"; process.env.GATE_OWNER_TOKEN = "owner-token-0123456789abcdef"; process.env.GATE_AGENT_TOKEN = "agent-token-0123456789abcdef"; process.env.REFUND_HISTORY_FILE = `/tmp/db-refunds-${process.pid}-${Math.random()}.json`;
 const { AgentPool, ResultStore, tribunal, PROMPTS } = await import("@deploybug/workers");
 const { buildGate } = await import("../apps/gate/src/app.ts");
 const { TelegramNotifier } = await import("@deploybug/notifier");
@@ -63,13 +63,16 @@ test("sandbox per task stays off on the Free plan", () => {
   delete process.env.SANDBOX_PER_TASK;
 });
 test("confirmed hack on a live change rolls back without approval", async () => {
-  const sig = "\n\nDeploy-Bug-Approved: t1\nDeploy-Bug-Signature: " + "a".repeat(64);
-  const source = { async commits() { return [{ sha: "c3", message: "x" + sig }, { sha: "c2", message: "y" + sig }]; }, async guardGreen() { return true; }, async changedPaths() { return ["a.ts"]; }, async fileAt(s: string) { return s === "c2" ? "good" : "bad"; } };
+  const { signCommit } = await import("@deploybug/policy");
+  const R = "Giuliano-Intelligence/Deploy-Bug";
+  const files: Record<string, any[]> = { c3: [{ path: "a.ts", content: "bad" }], c2: [{ path: "a.ts", content: "good" }] };
+  const msg = (s: string) => `x\n\nDeploy-Bug-Approved: t-${s}\nDeploy-Bug-Signature: ${signCommit("k", `t-${s}`, R, "main", files[s])}`;
+  const source = { async commits() { return [{ sha: "c3", message: msg("c3") }, { sha: "c2", message: msg("c2") }]; }, async guardGreen() { return true; }, async changedPaths() { return ["a.ts"]; }, async fileAt(s: string) { return s === "c2" ? "good" : "bad"; }, async commitFiles(s: string) { return files[s]; } };
   const log: string[] = [];
   const ops = { async headOf() { return "c3"; }, async createBranch() {}, async commit() { return "c4"; }, async guardConclusion() { return "success" as const; }, async fastForward(b: string) { log.push(`ff ${b}`); }, async deleteBranch() {} };
   const r = runner({ injection_checker: check("block", "same"), auditor: () => ({ ok: true }) });
   const g = buildGate({ notifier: new TelegramNotifier(undefined), runner: r.fn as any, store: new ResultStore(dir()), rollback: { source, ops, wait: { tries: 2, ms: 1 } }, redeploy: async () => ({}) });
-  const res = await g.app.request("/incident", { method: "POST", headers: { authorization: "Bearer gt", "content-type": "application/json" }, body: JSON.stringify({ repo: "Giuliano-Intelligence/Deploy-Bug", evidence: "suspicious change in a.ts" }) });
+  const res = await g.app.request("/incident", { method: "POST", headers: { authorization: "Bearer owner-token-0123456789abcdef", "content-type": "application/json" }, body: JSON.stringify({ repo: "Giuliano-Intelligence/Deploy-Bug", evidence: "suspicious change in a.ts" }) });
   const j: any = await res.json();
   assert.equal(j.hacked, true); assert.equal(j.rolledBack, true); assert.deepEqual(log, ["ff main"]);
 });

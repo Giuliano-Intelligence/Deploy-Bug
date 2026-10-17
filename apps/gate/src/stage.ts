@@ -57,7 +57,7 @@ export function composioStageOps(exec: (tool: string, args: Record<string, unkno
     async guardConclusion(sha) {
       const r = await exec("GITHUB_LIST_WORKFLOW_RUNS_FOR_A_REPOSITORY", { ...base, head_sha: sha });
       const runs: any[] = deepFind({ r }, "workflow_runs") ?? r?.data?.workflow_runs ?? [];
-      const run = runs.find(x => x.name === "deploybug-guard") ?? runs[0];
+      const run = runs.find(x => String(x.path ?? "").endsWith(".github/workflows/deploybug-guard.yml") && x.name === "deploybug-guard");
       if (!run || run.status !== "completed") return "pending";
       return run.conclusion === "success" ? "success" : "failure";
     },
@@ -104,7 +104,7 @@ export function appStageOps(api: (path: string, init?: RequestInit) => Promise<a
     },
     async guardConclusion(sha) {
       const r = await api(`/actions/runs?head_sha=${sha}`);
-      const run = (r.workflow_runs ?? []).find((x: any) => x.name === "deploybug-guard");
+      const run = (r.workflow_runs ?? []).find((x: any) => x.name === "deploybug-guard" && String(x.path ?? "").endsWith(".github/workflows/deploybug-guard.yml"));
       if (!run || run.status !== "completed") return "pending";
       return run.conclusion === "success" ? "success" : "failure";
     },

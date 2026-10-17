@@ -39,7 +39,7 @@ test("per-file commits are each signed over their own file, bound to the target 
 });
 test("composio ops use refs and never force", async () => {
   const calls: [string, any][] = [];
-  const ops = composioStageOps(async (t, a) => { calls.push([t, a]); if (t === "GITHUB_LIST_WORKFLOW_RUNS_FOR_A_REPOSITORY") return { data: { workflow_runs: [{ name: "deploybug-guard", status: "completed", conclusion: "success" }] } }; return { data: { commit: { sha: "s9" } } }; }, "o/r");
+  const ops = composioStageOps(async (t, a) => { calls.push([t, a]); if (t === "GITHUB_LIST_WORKFLOW_RUNS_FOR_A_REPOSITORY") return { data: { workflow_runs: [{ name: "deploybug-guard", path: ".github/workflows/deploybug-guard.yml", status: "completed", conclusion: "success" }] } }; return { data: { commit: { sha: "s9" } } }; }, "o/r");
   const r = await stagedPush(ops, { ...p, perFile: true }, fast);
   assert.equal(r.pushed, true);
   assert.deepEqual(calls.map(c => c[0]).filter(t => t.includes("REFERENCE")), ["GITHUB_CREATE_A_REFERENCE", "GITHUB_UPDATE_A_REFERENCE", "GITHUB_DELETE_A_REFERENCE"]);

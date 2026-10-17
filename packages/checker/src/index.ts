@@ -70,7 +70,9 @@ export class InjectionChecker {
     const weights = new Map(this.cfg.panel.map(m => [m.id ?? m.model, m.weight ?? 1]));
     let agg: number | undefined;
     if (ok.length) { const w = ok.reduce((s, r) => s + (weights.get(r.id) ?? 1), 0); agg = Math.round(ok.reduce((s, r) => s + r.score! * (weights.get(r.id) ?? 1), 0) / w); }
-    let score = agg === undefined ? h.score : Math.min(h.score, agg);
+    const failed = panel.length - ok.length;
+    const offline = process.env.CHECKER_OFFLINE === "1";
+    let score = agg === undefined ? (panel.length && !offline ? 0 : h.score) : Math.min(h.score, agg, failed && !offline ? Math.max(0, 100 - Math.round(100 * failed / panel.length)) : 100);
     let model = ok.length ? `panel(${ok.length}/${panel.length})` : "heuristic";
     let escalated = false;
     if (score < this.cfg.escalateBelow && this.cfg.escalation) {

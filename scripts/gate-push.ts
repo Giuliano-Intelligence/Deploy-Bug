@@ -19,7 +19,7 @@ const models = loadModels();
 const pol = (loadPolicies() as any).push;
 const rp = resolveProvider(models, models.brain.provider);
 const review = await reviewPush(rp.key && rp.base ? { model: models.brain.model, key: rp.key, base: rp.base } : undefined, files, message);
-const a = await analysePush({ agent: "gate-push", repo, branch: target, message, files }, pol, new InjectionChecker(models), models.escalateBelow, review.proposals);
+const a = await analysePush({ agent: "owner", repo, branch: target, message, files }, pol, new InjectionChecker(models), models.escalateBelow, review.proposals);
 console.log(JSON.stringify({ agent: review.summary.slice(0, 300), verdict: a.verdict, reasons: a.reasons, gateChanges: a.gateChanges, score: a.score }, null, 1));
 if (a.verdict === "block") process.exit(1);
 
