@@ -150,10 +150,13 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
   const toolkitAgents = new ToolkitAgents(() => ep(models.brain.provider, models.brain.model), newPool);
   const connectFn = opts.connect ?? (async (toolkits: string[]) => {
     const cred = await vault.get(process.env.OWNER_USER ?? "owner", "composio");
-    const key = cred?.apiKey ?? (existsSync("/tmp/keys/composio") ? readFileSync("/tmp/keys/composio", "utf8").trim() : "");
-    if (!key.startsWith("ck_")) throw new Error("no Composio Connect key");
-    const r: any = await new ComposioConnectMcp(key).callTool("COMPOSIO_MANAGE_CONNECTIONS", { toolkits: toolkits.map(name => ({ name, action: "add" })) });
-    return r?.data?.results ?? {};
+    const keys = [cred?.apiKey, existsSync("/tmp/keys/composio") ? readFileSync("/tmp/keys/composio", "utf8").trim() : ""].filter((k): k is string => !!k && k.startsWith("ck_"));
+    if (!keys.length) throw new Error("no Composio Connect key");
+    let last: unknown;
+    for (const key of [...new Set(keys)]) {
+      try { const r: any = await new ComposioConnectMcp(key).callTool("COMPOSIO_MANAGE_CONNECTIONS", { toolkits: toolkits.map(name => ({ name, action: "add" })) }); return r?.data?.results ?? {}; } catch (e) { last = e; }
+    }
+    throw last;
   });
 
   const chargeOwner = opts.chargeLookup ?? (async (charge: string, user?: string) => {
