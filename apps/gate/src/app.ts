@@ -226,7 +226,9 @@ export function buildGate(opts: { notifier?: TelegramNotifier; vault?: Credentia
   app.post("/ui/connect/:slug", async c => {
     if (!isOwner(c) && !sessionOk(c)) return c.json({ error: "unauthorized" }, 401);
     const origin = c.req.header("origin");
-    if (origin && new URL(origin).host !== new URL(c.req.url).host && origin.replace(/^https?:\/\//, "") !== c.req.header("host")) return c.json({ error: "bad origin" }, 403);
+    const site = c.req.header("sec-fetch-site");
+    const hosts = [new URL(c.req.url).host, c.req.header("host"), c.req.header("x-forwarded-host"), process.env.PUBLIC_HOST].filter(Boolean);
+    if (origin && site !== "same-origin" && !hosts.includes(new URL(origin).host)) return c.json({ error: "bad origin" }, 403);
     const k: any = CONNECTORS.find(x => x.slug === c.req.param("slug"));
     if (!k) return c.json({ error: "not in catalog" }, 404);
     if (k.via === "custom_mcp") return c.json({ setup: { name: k.name, mcp: k.mcp ?? "", auth: k.auth ?? "API_KEY", steps: ["Open Composio, Custom MCP, Add server", `Paste the endpoint ${k.mcp ?? ""}`, k.auth === "DCR_OAUTH" ? "Pick OAuth and sign in when asked" : "Pick API key auth and paste your key there, never in chat", "Come back and tap Sync"] } });
